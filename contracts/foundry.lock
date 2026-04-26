@@ -1,0 +1,23 @@
+{
+  "lib/forge-std": {
+    "tag": {
+      "name": "v1.16.0",
+      "rev": "8987040ede9553cea20c95ad40d0455930f9c8e0"
+    }
+  },
+  "lib/sp1-contracts": {
+    "tag": {
+      "name": "v6.1.0",
+      "rev": "2ac5ecbbe473421a963d67e55f182e9a36576f7c"
+    }
+  },
+  "lib/v4-core": {
+    "tag": {
+      "name": "v4.0.0",
+      "rev": "e50237c43811bd9b526eff40f26772152a42daba"
+    }
+  },
+  "lib/v4-periphery": {
+    "rev": "9dafaaecc1e2e1e824eda9d941085f96517d827b"
+  }
+}
