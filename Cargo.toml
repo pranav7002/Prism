@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/prism-types",
+    "crates/prism-solver",
+    "crates/prism-orchestrator",
+]
+# SP1 programs are intentionally excluded from the root workspace: they compile
+# to the `riscv32im-succinct-zkvm-elf` target via `cargo prove build` and have
+# their own per-package lockfiles. Check them individually with
+# `cargo check -p solver-proof --manifest-path sp1-programs/solver-proof/Cargo.toml`
+# (or just `cd sp1-programs/<name> && cargo check`).
+exclude = [
+    "sp1-programs/solver-proof",
+    "sp1-programs/execution-proof",
+    "sp1-programs/shapley-proof",
+    "sp1-programs/aggregator",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tiny-keccak = { version = "2", features = ["keccak"] }
+hex = "0.4"
+thiserror = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+tokio-tungstenite = "0.21"
+sp1-sdk = "3.0.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
