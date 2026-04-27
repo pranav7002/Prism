@@ -457,3 +457,278 @@ impl WsEvent {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AgentIntentWire {
+    pub agent_id: String,
+    pub epoch: u64,
+    pub target_protocol: String,
+    pub action: ActionWire,
+    pub priority: u8,
+    pub max_slippage_bps: u16,
+    #[serde(default)]
+    pub expected_profit_bps: u16,
+    pub salt: String,
+}
+
+/// Wire form of `ConsolidateRemove`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConsolidateRemoveWire {
+    pub pool: String,
+    pub liquidity: String,
+}
+
+/// Wire form of `ConsolidateAdd`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ConsolidateAddWire {
+    pub pool: String,
+    pub amount0: String,
+    pub amount1: String,
+    pub tick_lower: i32,
+    pub tick_upper: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ActionWire {
+    Swap {
+        pool: String,
+        token_in: String,
+        token_out: String,
+        amount_in: String,
+        min_out: String,
+    },
+    AddLiquidity {
+        pool: String,
+        amount0: String,
+        amount1: String,
+        tick_lower: i32,
+        tick_upper: i32,
+    },
+    RemoveLiquidity {
+        pool: String,
+        liquidity: String,
+    },
+    Backrun {
+        target_tx: String,
+        profit_token: String,
+    },
+    DeltaHedge {
+        position_id: u64,
+        delta: i64,
+    },
+    MigrateLiquidity {
+        from_pool: String,
+        to_pool: String,
+        amount: String,
+        tick_lower: i32,
+        tick_upper: i32,
+    },
+    BatchConsolidate {
+        removes: Vec<ConsolidateRemoveWire>,
+        adds: Vec<ConsolidateAddWire>,
+    },
+    SetDynamicFee {
+        pool: String,
+        new_fee_ppm: u32,
+    },
+    CrossProtocolHedge {
+        aave_borrow_asset: String,
+        aave_borrow_amount: String,
+        uniswap_pool: String,
+        uniswap_token_in: String,
+        uniswap_token_out: String,
+        uniswap_amount_in: String,
+    },
+    KillSwitch {
+        reason: String,
+    },
+}
+
+/// Errors returned by wire → internal conversion.
+#[derive(Debug)]
+pub enum WireError {
+    BadHex(String),
+    BadLength { field: &'static str, expected: usize, got: usize },
+    BadDecimal(String),
+}
+
+impl std::fmt::Display for WireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WireError::BadHex(s) => write!(f, "bad hex: {}", s),
+            WireError::BadLength { field, expected, got } => {
+                write!(f, "bad length for {}: expected {}, got {}", field, expected, got)
+            }
+            WireError::BadDecimal(s) => write!(f, "bad decimal: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for WireError {}
+
+fn decode_fixed<const N: usize>(s: &str, field: &'static str) -> Result<[u8; N], WireError> {
+    let trimmed = s.trim_start_matches("0x");
+    let bytes = hex::decode(trimmed).map_err(|_| WireError::BadHex(s.to_string()))?;
+    if bytes.len() != N {
+        return Err(WireError::BadLength {
+            field,
+            expected: N,
+            got: bytes.len(),
+        });
+    }
+    let mut out = [0u8; N];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    format!("0x{}", hex::encode(bytes))
+}
+
+fn parse_u128(s: &str) -> Result<u128, WireError> {
+    s.parse::<u128>().map_err(|_| WireError::BadDecimal(s.to_string()))
+}
+
+impl AgentIntentWire {
+    /// Convert to the internal, bincode-friendly `AgentIntent`. The returned
+    /// intent's `commitment` is recomputed from the parsed fields — the wire
+    /// form does not include an explicit commitment (it is derived).
+    pub fn to_internal(&self) -> Result<AgentIntent, WireError> {
+        let agent_id = AgentId(decode_fixed::<20>(&self.agent_id, "agent_id")?);
+        let salt = decode_fixed::<32>(&self.salt, "salt")?;
+        let action = self.action.to_internal()?;
+        let intent = AgentIntent::new_with_commitment(
+            agent_id,
+            self.epoch,
+            self.target_protocol.clone(),
+            action,
+            self.priority,
+            self.max_slippage_bps,
+            salt,
+        );
+        Ok(intent)
+    }
+}
+
+impl ActionWire {
+    fn to_internal(&self) -> Result<Action, WireError> {
+        Ok(match self {
+            ActionWire::Swap {
+                pool,
+                token_in,
+                token_out,
+                amount_in,
+                min_out,
+            } => Action::Swap {
+                pool: decode_fixed::<20>(pool, "pool")?,
+                token_in: decode_fixed::<20>(token_in, "token_in")?,
+                token_out: decode_fixed::<20>(token_out, "token_out")?,
+                amount_in: parse_u128(amount_in)?,
+                min_out: parse_u128(min_out)?,
+            },
+            ActionWire::AddLiquidity {
+                pool,
+                amount0,
+                amount1,
+                tick_lower,
+                tick_upper,
+            } => Action::AddLiquidity {
+                pool: decode_fixed::<20>(pool, "pool")?,
+                amount0: parse_u128(amount0)?,
+                amount1: parse_u128(amount1)?,
+                tick_lower: *tick_lower,
+                tick_upper: *tick_upper,
+            },
+            ActionWire::RemoveLiquidity { pool, liquidity } => Action::RemoveLiquidity {
+                pool: decode_fixed::<20>(pool, "pool")?,
+                liquidity: parse_u128(liquidity)?,
+            },
+            ActionWire::Backrun {
+                target_tx,
+                profit_token,
+            } => Action::Backrun {
+                target_tx: decode_fixed::<32>(target_tx, "target_tx")?,
+                profit_token: decode_fixed::<20>(profit_token, "profit_token")?,
+            },
+            ActionWire::DeltaHedge { position_id, delta } => Action::DeltaHedge {
+                position_id: *position_id,
+                delta: *delta,
+            },
+            ActionWire::MigrateLiquidity {
+                from_pool,
+                to_pool,
+                amount,
+                tick_lower,
+                tick_upper,
+            } => Action::MigrateLiquidity {
+                from_pool: decode_fixed::<20>(from_pool, "from_pool")?,
+                to_pool: decode_fixed::<20>(to_pool, "to_pool")?,
+                amount: parse_u128(amount)?,
+                tick_lower: *tick_lower,
+                tick_upper: *tick_upper,
+            },
+            ActionWire::BatchConsolidate { removes, adds } => {
+                let mut rs = Vec::with_capacity(removes.len());
+                for r in removes {
+                    rs.push(ConsolidateRemove {
+                        pool: decode_fixed::<20>(&r.pool, "pool")?,
+                        liquidity: parse_u128(&r.liquidity)?,
+                    });
+                }
+                let mut as_ = Vec::with_capacity(adds.len());
+                for a in adds {
+                    as_.push(ConsolidateAdd {
+                        pool: decode_fixed::<20>(&a.pool, "pool")?,
+                        amount0: parse_u128(&a.amount0)?,
+                        amount1: parse_u128(&a.amount1)?,
+                        tick_lower: a.tick_lower,
+                        tick_upper: a.tick_upper,
+                    });
+                }
+                Action::BatchConsolidate {
+                    removes: rs,
+                    adds: as_,
+                }
+            }
+            ActionWire::SetDynamicFee { pool, new_fee_ppm } => Action::SetDynamicFee {
+                pool: decode_fixed::<20>(pool, "pool")?,
+                new_fee_ppm: *new_fee_ppm,
+            },
+            ActionWire::CrossProtocolHedge {
+                aave_borrow_asset,
+                aave_borrow_amount,
+                uniswap_pool,
+                uniswap_token_in,
+                uniswap_token_out,
+                uniswap_amount_in,
+            } => Action::CrossProtocolHedge {
+                aave_borrow_asset: decode_fixed::<20>(aave_borrow_asset, "aave_borrow_asset")?,
+                aave_borrow_amount: parse_u128(aave_borrow_amount)?,
+                uniswap_pool: decode_fixed::<20>(uniswap_pool, "uniswap_pool")?,
+                uniswap_token_in: decode_fixed::<20>(uniswap_token_in, "uniswap_token_in")?,
+                uniswap_token_out: decode_fixed::<20>(uniswap_token_out, "uniswap_token_out")?,
+                uniswap_amount_in: parse_u128(uniswap_amount_in)?,
+            },
+            ActionWire::KillSwitch { reason } => Action::KillSwitch {
+                reason: reason.clone(),
+            },
+        })
+    }
+}
+
+impl From<&AgentIntent> for AgentIntentWire {
+    fn from(intent: &AgentIntent) -> Self {
+        AgentIntentWire {
+            agent_id: encode_hex(&intent.agent_id.0),
+            epoch: intent.epoch,
+            target_protocol: intent.target_protocol.clone(),
+            action: (&intent.action).into(),
+            priority: intent.priority,
+            max_slippage_bps: intent.max_slippage_bps,
+            expected_profit_bps: 0,
+            salt: encode_hex(&intent.salt),
+        }
+    }
+}
+
+impl From<&Action> for ActionWire {
+    fn from(a: &Action) -> Self {
