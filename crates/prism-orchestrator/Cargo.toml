@@ -1,0 +1,38 @@
+[package]
+name = "prism-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Main PRISM runner: epoch loop, proving pipeline, WebSocket server."
+
+[features]
+# Default: substitute empty byte slices for SP1 ELFs so `cargo check` /
+# `cargo run` work on a fresh checkout before `cargo prove build` has been
+# run. Disable this feature to include real ELFs.
+default = ["mock-elf"]
+mock-elf = []
+# Pulls in the SP1 prover SDK. Enable alongside `--no-default-features` to
+# turn on real proving once ELFs have been produced by `cargo prove build`.
+real-prover = ["dep:sp1-sdk"]
+
+[dependencies]
+prism-types = { path = "../prism-types" }
+prism-solver = { path = "../prism-solver" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+# sp1-sdk is referenced only from code gated behind `not(feature = "mock-elf")`.
+# Kept here so switching off `mock-elf` pulls it in automatically.
+sp1-sdk = { workspace = true, optional = true }
+
+[[bin]]
+name = "prism-orchestrator"
+path = "src/main.rs"
