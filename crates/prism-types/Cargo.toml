@@ -10,3 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tiny-keccak = { workspace = true }
 hex = { workspace = true }
+
+[[example]]
+name = "print_test_vector"
+path = "examples/print_test_vector.rs"
