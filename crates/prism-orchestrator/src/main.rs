@@ -42,13 +42,21 @@ use crate::uniswap_client::{MockUniswapClient, UniswapClient};
 ///
 /// The Python broadcaster sends:
 /// ```json
-/// { "type": "SubmitIntent", "intent": { ...AgentIntentWire... } }
+/// { "type": "SubmitIntent", "intent": { ...AgentIntentWire... }, "commitment": "0x…" }
 /// ```
+///
+/// `commitment` is the agent-supplied keccak commitment over the intent
+/// payload. The orchestrator MUST verify this against the value it
+/// recomputes from the wire intent — that's what makes the reveal step
+/// binding (without it, an agent could submit one set of fields and claim
+/// any commitment, which is the bug C7 in the audit report).
 #[derive(Debug, Deserialize)]
 struct WsIncoming {
     #[serde(rename = "type")]
     msg_type: String,
     intent: Option<AgentIntentWire>,
+    /// 0x-prefixed 32-byte hex string. Required for `SubmitIntent`.
+    commitment: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +69,9 @@ pub struct OrchestratorConfig {
     pub epoch_duration_secs: u64,
     pub use_mock_prover: bool,
     pub uniswap_api_url: String,
+    /// Pool address fed to the (Mock|Real)UniswapClient. Required — must be
+    /// set per chain (Unichain Sepolia ≠ mainnet ≠ local). No safe default.
+    pub pool_address: String,
     /// Aave V3 Pool contract address. When `None`, the epoch loop uses
     /// `aave_client::fallback_healthy()` (HF=2.0) instead of an RPC call.
     pub aave_pool_address: Option<String>,
@@ -87,6 +98,14 @@ impl OrchestratorConfig {
                 .unwrap_or(true),
             uniswap_api_url: std::env::var("UNISWAP_API_URL")
                 .unwrap_or_else(|_| "https://api.uniswap.org".into()),
+            pool_address: std::env::var("POOL_ADDRESS").unwrap_or_else(|_| {
+                // Sentinel zero address. Real deployments MUST set
+                // POOL_ADDRESS — the orchestrator logs a warning at startup
+                // when it sees this default. Using mainnet USDC/WETH as a
+                // silent fallback (the previous behavior) is wrong on every
+                // testnet and produced misleading mock pool data.
+                "0x0000000000000000000000000000000000000000".into()
+            }),
             aave_pool_address: std::env::var("AAVE_POOL_ADDRESS").ok(),
             aave_rpc_url: std::env::var("AAVE_RPC_URL").unwrap_or(unichain_rpc),
             aave_user_address: std::env::var("AAVE_USER_ADDRESS").ok(),
@@ -168,7 +187,10 @@ async fn run_epoch_loop(
     let mut tick = interval(Duration::from_secs(config.epoch_duration_secs));
     let mut epoch: u64 = 1;
 
-    let pool_address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8";
+    let pool_address = config.pool_address.as_str();
+    if pool_address == "0x0000000000000000000000000000000000000000" {
+        warn!("POOL_ADDRESS not set — running on a sentinel zero address; live UniswapClient calls will fail and the orchestrator will fall back to mock pool state every epoch");
+    }
     let market = UniswapClient::new(&config.uniswap_api_url);
     let mock_market = MockUniswapClient; // cold-start / hard-failure fallback
     let mut last_known_state: Option<ProtocolState> = None;
@@ -427,12 +449,44 @@ async fn handle_incoming_text(
     };
 
     let agent_id = wire.agent_id.clone();
+
+    // Parse the envelope-level commitment the agent supplied. We compare it
+    // against the value `to_internal` recomputes from the wire fields. If
+    // the agent sent fields that don't hash to the commitment they claimed,
+    // reject — that's an integrity failure or a different intent being
+    // smuggled in under a previously-revealed commitment.
+    let claimed_commitment: [u8; 32] = match msg.commitment.as_deref() {
+        Some(hex_str) => {
+            let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+            match hex::decode(stripped).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
+                Some(arr) => arr,
+                None => {
+                    warn!(
+                        "ws {}: intent from {} has malformed commitment hex — rejected",
+                        addr, agent_id
+                    );
+                    return;
+                }
+            }
+        }
+        None => {
+            warn!(
+                "ws {}: SubmitIntent from {} missing 'commitment' field — rejected",
+                addr, agent_id
+            );
+            return;
+        }
+    };
+
     match wire.to_internal() {
         Ok(internal) => {
-            if !internal.verify_commitment() {
+            if internal.commitment != claimed_commitment {
                 warn!(
-                    "ws {}: intent from {} has invalid commitment — rejected",
-                    addr, agent_id
+                    "ws {}: intent from {} commitment mismatch — claimed=0x{} computed=0x{} — rejected",
+                    addr,
+                    agent_id,
+                    hex::encode(claimed_commitment),
+                    hex::encode(internal.commitment),
                 );
                 return;
             }

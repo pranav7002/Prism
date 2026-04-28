@@ -266,8 +266,20 @@ pub async fn prove_epoch(
 
     // ABI-encode publicValues as (uint256 epoch, uint16[] payouts) so the
     // on-chain PrismHook.settleEpoch can abi.decode them directly.
+    //
+    // On the real-prover path the SP1 aggregator program *also* computes
+    // and commits these exact bytes — we pass `payouts_bps` to it as stdin
+    // and it calls `commit_slice(&abi_bytes)`. We then take the proof's
+    // committed `public_values` verbatim (no overwrite), so the on-chain
+    // `sha256(publicValues)` digest matches what the proof bound. (The
+    // pre-fix code overwrote `agg.public_values` post-aggregation, which
+    // broke SP1 verification — see AUDIT_REPORT.md C2.)
+    //
+    // On the mock path no real SP1 verifier runs, so the orchestrator just
+    // produces the same bytes locally and stuffs them into the mock proof's
+    // `public_values`.
     let payouts_bps: Vec<u16> = shapley_weights.iter().map(|(_, w)| *w).collect();
-    let public_values = encode_public_values_abi(plan_epoch, &payouts_bps);
+    let mock_public_values = encode_public_values_abi(plan_epoch, &payouts_bps);
 
     let aggregated = match real_prover.as_ref() {
         Some(rp) => {
@@ -279,9 +291,10 @@ pub async fn prove_epoch(
                     solver_artifact,
                     execution_artifact,
                     shapley_artifact,
+                    payouts_bps.clone(),
                 )
                 .await?;
-                agg.public_values = public_values;
+                // public_values comes from the proof itself — do NOT overwrite.
                 agg.shapley_weights = shapley_weights.clone();
                 agg
             }
@@ -296,7 +309,7 @@ pub async fn prove_epoch(
                         &execution_artifact.stub_bytes,
                         &shapley_artifact.stub_bytes,
                     ]),
-                    public_values,
+                    public_values: mock_public_values,
                     shapley_weights: shapley_weights.clone(),
                 }
             }
@@ -307,7 +320,7 @@ pub async fn prove_epoch(
                 &execution_artifact.stub_bytes,
                 &shapley_artifact.stub_bytes,
             ]),
-            public_values,
+            public_values: mock_public_values,
             shapley_weights: shapley_weights.clone(),
         },
     };
@@ -485,7 +498,9 @@ async fn run_shapley_task(
                 // The shapley program then re-XORs its argument inside, so we
                 // simply pass `plan.epoch` here and let the program do the XOR.
                 let random_seed: u64 = plan.epoch;
-                let num_samples: u32 = 1024;
+                // Must equal `prism_solver::SHAPLEY_NUM_SAMPLES` — diverging values
+                // produce different Shapley vectors off-chain vs in-circuit.
+                let num_samples: u32 = prism_solver::SHAPLEY_NUM_SAMPLES;
                 let mev_value: u128 = plan.cooperative_mev_value;
                 let mut stdin = SP1Stdin::new();
                 stdin.write(&plan);
@@ -568,6 +583,7 @@ async fn run_aggregator_real(
     solver: ChildProofArtifact,
     execution: ChildProofArtifact,
     shapley: ChildProofArtifact,
+    payouts_bps: Vec<u16>,
 ) -> anyhow::Result<AggregatedProof> {
     tokio::task::spawn_blocking(move || -> anyhow::Result<AggregatedProof> {
         let mut stdin = SP1Stdin::new();
@@ -619,7 +635,10 @@ async fn run_aggregator_real(
         stdin.write(&execution.epoch);
         stdin.write(&shapley.proof_hash);
         stdin.write(&shapley.epoch);
-        stdin.write(&shapley.payouts);
+        // Pass basis-point Shapley payouts; the aggregator program ABI-encodes
+        // these into its committed public_values (replaces the prior
+        // `Vec<(AgentId, u128)>` token-unit shape).
+        stdin.write(&payouts_bps);
 
         // Final proof: Groth16 (260-byte on-chain shape).
         let proof = rp
@@ -628,9 +647,14 @@ async fn run_aggregator_real(
             .groth16()
             .run()?;
 
+        // Take public_values straight from the proof — these are the bytes
+        // the aggregator program committed via `commit_slice`, byte-equal to
+        // `abi.encode(uint256 epoch, uint16[] payouts)` for `settleEpoch`.
+        let public_values = proof.public_values.to_vec();
+
         Ok(AggregatedProof {
             proof_bytes: proof.bytes(),
-            public_values: Vec::new(),  // overwritten by caller
+            public_values,
             shapley_weights: Vec::new(), // overwritten by caller
         })
     })

@@ -78,6 +78,11 @@ pub async fn settle_epoch_onchain(
 
     // Use Foundry's `cast send` to submit the transaction.
     // `cast` handles: ABI encoding, nonce, gas estimation, EIP-1559, signing.
+    //
+    // The private key goes via `ETH_PRIVATE_KEY` env var on the spawned
+    // process (cast reads it automatically when `--private-key` is omitted).
+    // Passing it as a CLI arg would expose it in /proc/<pid>/cmdline to any
+    // other user on the host.
     let output = tokio::process::Command::new("cast")
         .args([
             "send",
@@ -85,12 +90,11 @@ pub async fn settle_epoch_onchain(
             "settleEpoch(bytes,bytes)",
             &proof_hex,
             &pv_hex,
-            "--private-key",
-            &config.private_key,
             "--rpc-url",
             &config.rpc_url,
             "--json",
         ])
+        .env("ETH_PRIVATE_KEY", &config.private_key)
         .output()
         .await
         .map_err(|e| {

@@ -363,8 +363,10 @@ const LCG_MUL: u64 = 6_364_136_223_846_793_005;
 /// LCG increment — same constant used in the SP1 zkVM circuit.
 const LCG_INC: u64 = 1_442_695_040_888_963_407;
 /// Number of Monte Carlo permutation samples. 1000 gives <1% error for
-/// 5 agents. The SP1 circuit uses the same value.
-const SHAPLEY_NUM_SAMPLES: u32 = 1_000;
+/// 5 agents. The SP1 circuit uses the same value (the orchestrator passes
+/// it as stdin to `shapley-proof` — it MUST read this constant, not its
+/// own literal, or proven and paid Shapley vectors diverge).
+pub const SHAPLEY_NUM_SAMPLES: u32 = 1_000;
 
 fn lcg_next(state: &mut u64) -> u64 {
     *state = state.wrapping_mul(LCG_MUL).wrapping_add(LCG_INC);
