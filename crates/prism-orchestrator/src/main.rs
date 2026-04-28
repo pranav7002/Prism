@@ -200,6 +200,13 @@ async fn run_epoch_loop(
         .as_deref()
         .map(|addr| AaveClient::new(&config.aave_rpc_url, addr));
 
+    // Intents that arrived during epoch N tagged with epoch N+1 — held
+    // until that tick fires. Without this buffer, agents that broadcast
+    // slightly ahead of the orchestrator's tick get their intents
+    // silently dropped (H1 in AUDIT_REPORT). Cleared at start of each
+    // tick after merging into the current epoch's live_intents.
+    let mut next_epoch_buffer: Vec<AgentIntent> = Vec::new();
+
     loop {
         tick.tick().await;
 
@@ -213,23 +220,40 @@ async fn run_epoch_loop(
 
         // -------------------------------------------------------------------
         // Drain live intents from the WS channel; fall back to mock if none.
+        //
+        // Commit window: accept intent.epoch ∈ {epoch, epoch+1}. The current
+        // epoch goes into live_intents now; the next-epoch ones get buffered
+        // for the next tick. Anything outside that two-epoch window is a
+        // genuine misbehavior or a long network stall — log and drop.
         // -------------------------------------------------------------------
-        let mut live_intents: Vec<AgentIntent> = Vec::new();
+        let mut live_intents: Vec<AgentIntent> = std::mem::take(&mut next_epoch_buffer)
+            .into_iter()
+            .filter(|i| i.epoch == epoch)
+            .collect();
         let mut discarded_epoch_mismatch: u32 = 0;
         while let Ok(intent) = intent_rx.try_recv() {
             if intent.epoch == epoch {
                 live_intents.push(intent);
+            } else if intent.epoch == epoch + 1 {
+                // Agent ran slightly ahead — hold for next tick.
+                next_epoch_buffer.push(intent);
             } else {
                 discarded_epoch_mismatch += 1;
                 warn!(
-                    "epoch {}: discarded intent from agent {:?} (intent.epoch={}, expected={})",
-                    epoch, intent.agent_id, intent.epoch, epoch,
+                    "epoch {}: discarded intent from agent {:?} (intent.epoch={}, expected {} or {})",
+                    epoch, intent.agent_id, intent.epoch, epoch, epoch + 1,
                 );
             }
         }
+        if !next_epoch_buffer.is_empty() {
+            info!(
+                "epoch {}: buffered {} intent(s) for epoch {}",
+                epoch, next_epoch_buffer.len(), epoch + 1,
+            );
+        }
         if discarded_epoch_mismatch > 0 {
             info!(
-                "epoch {}: discarded {} intents with wrong epoch",
+                "epoch {}: discarded {} intents with out-of-window epoch",
                 epoch, discarded_epoch_mismatch,
             );
         }
