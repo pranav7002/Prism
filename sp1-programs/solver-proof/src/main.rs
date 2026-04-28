@@ -299,6 +299,15 @@ pub fn main() {
     let _protocol_state: ProtocolState = sp1_zkvm::io::read();
     let plan: ExecutionPlan = sp1_zkvm::io::read();
 
+    // Constraint 0: non-empty input. An empty input would pass commitment +
+    // ordering trivially and produce a non-empty proof for an empty epoch;
+    // the aggregator's intents_hash != [0;32] check doesn't catch this
+    // because sha256("") is non-zero. Reject inside the zkVM (M4).
+    assert!(
+        !input_intents.is_empty(),
+        "solver-proof requires at least one input intent"
+    );
+
     // Constraint 1: commitment binding.
     for intent in &input_intents {
         assert!(

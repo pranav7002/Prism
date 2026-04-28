@@ -211,8 +211,14 @@ pub fn main() {
                 );
             }
             Action::AddLiquidity { .. } => {
+                // Volatility ceiling for AddLiquidity. Aligned with the
+                // off-chain solver's volatility cutoff (5_000 bps) so a plan
+                // that the solver accepts cannot fail proof generation
+                // purely on this constant — H5 in AUDIT_REPORT. Plans with
+                // vol ∈ [3000, 5000] previously passed the solver and then
+                // failed here.
                 assert!(
-                    state.volatility_30d_bps < 3_000,
+                    state.volatility_30d_bps < 5_000,
                     "volatility {} bps too high for LP",
                     state.volatility_30d_bps
                 );
@@ -263,6 +269,9 @@ pub fn main() {
                     aave_borrow_asset == uniswap_token_in,
                     "hedge: borrow asset != swap token_in"
                 );
+                // CrossProtocolHedge implies an Aave borrow — same risk
+                // profile as Backrun. Trip the post-action HF check (M5).
+                saw_backrun = true;
             }
             Action::RemoveLiquidity { .. }
             | Action::DeltaHedge { .. }
@@ -270,6 +279,7 @@ pub fn main() {
         }
     }
 
+    // saw_backrun is also set by CrossProtocolHedge — see M5 above.
     if saw_backrun {
         assert!(health.is_safe(), "post-execution health factor <= 1.05");
     }
