@@ -192,3 +192,267 @@ fn apply_beta_before_delta(intents: &mut Vec<AgentIntent>) {
 // Cooperative MEV valuation
 // ---------------------------------------------------------------------------
 
+pub struct CooperativeMevCalculator;
+
+impl CooperativeMevCalculator {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Rough heuristic value: per-action contributions summed in u128 token
+    /// units. SP1 Program 3 re-runs this off-chain estimate inside the zkVM
+    /// as a sanity sum; the Shapley program distributes it.
+    pub fn calculate_mev_value(
+        &self,
+        plan: &ExecutionPlan,
+        protocol_state: &ProtocolState,
+    ) -> u128 {
+        let mut total: u128 = 0;
+
+        for intent in &plan.ordered_intents {
+            match &intent.action {
+                Action::Backrun { .. } => {
+                    // Captured profit heuristic: fee_tier (in ppm) applied to
+                    // a notional of 1e18 tokens.
+                    let notional: u128 = 1_000_000_000_000_000_000;
+                    let contribution = notional
+                        .saturating_mul(protocol_state.fee_tier as u128)
+                        / 1_000_000u128;
+                    total = total.saturating_add(contribution);
+                }
+                Action::Swap { amount_in, .. } => {
+                    // Positive slippage savings from priority ordering.
+                    let priority_diff = intent.priority as u128;
+                    let base = amount_in.saturating_mul(priority_diff);
+                    let savings = base / 10_000u128;
+                    let bound = amount_in
+                        .saturating_mul(intent.max_slippage_bps as u128)
+                        / 10_000;
+                    total = total.saturating_add(savings.min(bound));
+                }
+                _ => {}
+            }
+        }
+
+        total
+    }
+}
+
+impl Default for CooperativeMevCalculator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kill-switch monitoring
+// ---------------------------------------------------------------------------
+
+pub struct KillSwitchMonitor;
+
+impl KillSwitchMonitor {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn should_trigger(&self, state: &ProtocolState, health: &HealthFactor) -> bool {
+        if health.value() < 1.02 {
+            return true;
+        }
+        if state.volatility_30d_bps > 5_000 {
+            return true;
+        }
+        if state.liquidity == 0 {
+            return true;
+        }
+        false
+    }
+
+    pub fn build_kill_switch_intent(&self, agent_id: AgentId, epoch: u64) -> AgentIntent {
+        let action = Action::KillSwitch {
+            reason: "volatility_or_health_threshold_breach".to_string(),
+        };
+        AgentIntent::new_with_commitment(
+            agent_id,
+            epoch,
+            "Uniswap".into(),
+            action,
+            255,
+            0,
+            [0u8; 32],
+        )
+    }
+}
+
+impl Default for KillSwitchMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level plan builder
+// ---------------------------------------------------------------------------
+
+pub fn build_execution_plan(
+    intents: Vec<AgentIntent>,
+    protocol_state: &ProtocolState,
+) -> Result<ExecutionPlan, SolverError> {
+    if intents.is_empty() {
+        return Err(SolverError::InsufficientAgents);
+    }
+
+    // Reject unverifiable intents early.
+    for intent in &intents {
+        if !intent.verify_commitment() {
+            return Err(SolverError::InvalidIntent(format!(
+                "commitment mismatch for agent {}",
+                intent.agent_id.to_hex()
+            )));
+        }
+    }
+
+    let epoch = intents[0].epoch;
+
+    let detector = ConflictDetector::new();
+    let conflicts = detector.detect(&intents);
+    if !conflicts.is_empty() {
+        // Surface only the kinds; resolver caller can re-detect for indices.
+        let kinds = conflicts.into_iter().map(|(_, _, k)| k).collect::<Vec<_>>();
+        return Err(SolverError::UnresolvableConflict(kinds));
+    }
+
+    let resolver = PriorityResolver::new();
+    let ordered = resolver.resolve(intents);
+
+    let placeholder_plan = ExecutionPlan {
+        epoch,
+        ordered_intents: ordered,
+        cooperative_mev_value: 0,
+        shapley_weights: vec![],
+    };
+
+    let mev = CooperativeMevCalculator::new().calculate_mev_value(&placeholder_plan, protocol_state);
+
+    let weights = monte_carlo_shapley(&placeholder_plan.ordered_intents, epoch);
+
+    Ok(ExecutionPlan {
+        epoch,
+        ordered_intents: placeholder_plan.ordered_intents,
+        cooperative_mev_value: mev,
+        shapley_weights: weights,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Monte Carlo Shapley value computation
+// ---------------------------------------------------------------------------
+//
+// Port of the algorithm from `sp1-programs/shapley-proof/src/main.rs`.
+// Uses an LCG PRNG + Fisher-Yates shuffle to estimate each agent's
+// marginal contribution across random coalition orderings.
+//
+// The valuation function v(S) = sum of priorities of agents in S.
+// For additive valuations, Shapley values converge to priority-proportional
+// shares, but we keep the Monte Carlo loop so the algorithm generalizes
+// when the valuation function becomes non-additive (e.g., cooperative MEV
+// synergies between β and δ).
+
+/// LCG multiplier — same constant used in the SP1 zkVM circuit.
+const LCG_MUL: u64 = 6_364_136_223_846_793_005;
+/// LCG increment — same constant used in the SP1 zkVM circuit.
+const LCG_INC: u64 = 1_442_695_040_888_963_407;
+/// Number of Monte Carlo permutation samples. 1000 gives <1% error for
+/// 5 agents. The SP1 circuit uses the same value.
+const SHAPLEY_NUM_SAMPLES: u32 = 1_000;
+
+fn lcg_next(state: &mut u64) -> u64 {
+    *state = state.wrapping_mul(LCG_MUL).wrapping_add(LCG_INC);
+    *state
+}
+
+fn fisher_yates_shuffle(arr: &mut [usize], state: &mut u64) {
+    let n = arr.len();
+    if n < 2 {
+        return;
+    }
+    for i in (1..n).rev() {
+        let r = lcg_next(state);
+        let j = (r as usize) % (i + 1);
+        arr.swap(i, j);
+    }
+}
+
+/// Compute Shapley values via Monte Carlo sampling and return basis-point
+/// weights summing to exactly 10,000.
+///
+/// `seed` is derived from the epoch to ensure deterministic results across
+/// runs. The same seed + intents always produce the same weights.
+fn monte_carlo_shapley(intents: &[AgentIntent], seed: u64) -> Vec<(AgentId, u16)> {
+    let n = intents.len();
+    if n == 0 {
+        return vec![];
+    }
+
+    let priorities: Vec<u128> = intents.iter().map(|i| i.priority as u128).collect();
+    let mut totals: Vec<u128> = vec![0u128; n];
+    let mut indices: Vec<usize> = (0..n).collect();
+    // XOR with a magic constant to decorrelate from sequential epoch seeds,
+    // matching the SP1 circuit's initialization.
+    let mut rng_state = seed ^ 0xDEAD_BEEF_CAFE_BABE;
+
+    for _ in 0..SHAPLEY_NUM_SAMPLES {
+        fisher_yates_shuffle(&mut indices, &mut rng_state);
+
+        // Walk the permutation accumulating priority_sum. Each agent's
+        // marginal contribution at their position is their own priority.
+        let mut running: u128 = 0;
+        for &idx in &indices {
+            let before = running;
+            running = running.saturating_add(priorities[idx]);
+            let marginal = running - before;
+            totals[idx] = totals[idx].saturating_add(marginal);
+        }
+    }
+
+    // Average over samples.
+    let avg: Vec<u128> = totals
+        .iter()
+        .map(|t| *t / SHAPLEY_NUM_SAMPLES as u128)
+        .collect();
+
+    // Normalize to 10,000 bps (efficiency axiom).
+    let target: u128 = 10_000;
+    let sum_avg: u128 = avg.iter().copied().sum();
+
+    if sum_avg == 0 {
+        // All priorities are zero — fall back to equal split.
+        let base = 10_000u16 / n as u16;
+        let remainder = 10_000u16 - base * n as u16;
+        return intents
+            .iter()
+            .enumerate()
+            .map(|(i, intent)| {
+                let w = if i == 0 { base + remainder } else { base };
+                (intent.agent_id, w)
+            })
+            .collect();
+    }
+
+    let mut result: Vec<(AgentId, u16)> = Vec::with_capacity(n);
+    let mut running_assigned: u128 = 0;
+    for i in 0..n {
+        let share = (avg[i].saturating_mul(target)) / sum_avg;
+        running_assigned = running_assigned.saturating_add(share);
+        result.push((intents[i].agent_id, share as u16));
+    }
+
+    // Rounding dust goes to first agent so sum == 10,000 exactly.
+    if running_assigned < target {
+        let dust = (target - running_assigned) as u16;
+        result[0].1 = result[0].1.saturating_add(dust);
+    }
+
+    result
+}
+
