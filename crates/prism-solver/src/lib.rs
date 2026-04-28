@@ -456,3 +456,264 @@ fn monte_carlo_shapley(intents: &[AgentIntent], seed: u64) -> Vec<(AgentId, u16)
     result
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prism_types::{Action, AgentId};
+
+    fn intent(
+        agent: u8,
+        priority: u8,
+        action: Action,
+        epoch: u64,
+    ) -> AgentIntent {
+        AgentIntent::new_with_commitment(
+            AgentId([agent; 20]),
+            epoch,
+            "Uniswap".into(),
+            action,
+            priority,
+            50,
+            [agent; 32],
+        )
+    }
+
+    fn swap(amount: u128) -> Action {
+        Action::Swap {
+            pool: [0xDD; 20],
+            token_in: [0x11; 20],
+            token_out: [0x22; 20],
+            amount_in: amount,
+            min_out: amount.saturating_mul(99) / 100,
+        }
+    }
+
+    fn backrun() -> Action {
+        Action::Backrun {
+            target_tx: [0xBB; 32],
+            profit_token: [0x22; 20],
+        }
+    }
+
+    fn delta() -> Action {
+        Action::DeltaHedge {
+            position_id: 7,
+            delta: -123,
+        }
+    }
+
+    fn killswitch() -> Action {
+        Action::KillSwitch {
+            reason: "panic".into(),
+        }
+    }
+
+    fn dummy_state() -> ProtocolState {
+        ProtocolState {
+            pool_address: [0xDD; 20],
+            sqrt_price_x96: 1,
+            liquidity: 1_000_000,
+            tick: 0,
+            fee_tier: 3_000,
+            token0_reserve: 1_000_000,
+            token1_reserve: 1_000_000,
+            volatility_30d_bps: 1_500,
+        }
+    }
+
+    #[test]
+    fn priority_sort_descending() {
+        let intents = vec![
+            intent(0x01, 10, swap(1), 1),
+            intent(0x02, 90, swap(2), 1),
+            intent(0x03, 50, swap(3), 1),
+        ];
+        let resolved = PriorityResolver::new().resolve(intents);
+        let priorities: Vec<u8> = resolved.iter().map(|i| i.priority).collect();
+        assert_eq!(priorities, vec![90, 50, 10]);
+    }
+
+    #[test]
+    fn beta_before_delta_swap() {
+        let intents = vec![
+            intent(0x01, 80, delta(), 1),   // δ at priority 80
+            intent(0x02, 70, backrun(), 1), // β at priority 70 — should move in front
+        ];
+        let resolved = PriorityResolver::new().resolve(intents);
+        assert!(matches!(resolved[0].action, Action::Backrun { .. }));
+        assert!(matches!(resolved[1].action, Action::DeltaHedge { .. }));
+    }
+
+    #[test]
+    fn killswitch_takes_first_slot_regardless_of_priority() {
+        let intents = vec![
+            intent(0x01, 99, swap(1), 1),
+            intent(0x02, 10, killswitch(), 1),
+        ];
+        let resolved = PriorityResolver::new().resolve(intents);
+        assert!(matches!(resolved[0].action, Action::KillSwitch { .. }));
+    }
+
+    #[test]
+    fn tie_break_by_agent_id_lex() {
+        let intents = vec![
+            intent(0xEE, 50, swap(1), 1),
+            intent(0x01, 50, swap(2), 1),
+        ];
+        let resolved = PriorityResolver::new().resolve(intents);
+        assert_eq!(resolved[0].agent_id, AgentId([0x01; 20]));
+        assert_eq!(resolved[1].agent_id, AgentId([0xEE; 20]));
+    }
+
+    #[test]
+    fn killswitch_monitor_triggers_on_health() {
+        let mon = KillSwitchMonitor::new();
+        let state = dummy_state();
+        let unhealthy = HealthFactor {
+            collateral_usd: 1_010_000,
+            debt_usd: 1_000_000,
+        };
+        assert!(mon.should_trigger(&state, &unhealthy));
+    }
+
+    #[test]
+    fn killswitch_monitor_triggers_on_volatility() {
+        let mon = KillSwitchMonitor::new();
+        let mut state = dummy_state();
+        state.volatility_30d_bps = 6_000;
+        let healthy = HealthFactor {
+            collateral_usd: 2_000_000,
+            debt_usd: 1_000_000,
+        };
+        assert!(mon.should_trigger(&state, &healthy));
+    }
+
+    #[test]
+    fn killswitch_monitor_triggers_on_zero_liquidity() {
+        let mon = KillSwitchMonitor::new();
+        let mut state = dummy_state();
+        state.liquidity = 0;
+        let healthy = HealthFactor {
+            collateral_usd: 2_000_000,
+            debt_usd: 1_000_000,
+        };
+        assert!(mon.should_trigger(&state, &healthy));
+    }
+
+    #[test]
+    fn conflict_detection_finds_liquidity_race() {
+        let intents = vec![
+            intent(
+                0x01,
+                50,
+                Action::RemoveLiquidity {
+                    pool: [0xAA; 20],
+                    liquidity: 1,
+                },
+                1,
+            ),
+            intent(
+                0x02,
+                50,
+                Action::RemoveLiquidity {
+                    pool: [0xAA; 20],
+                    liquidity: 2,
+                },
+                1,
+            ),
+        ];
+        let conflicts = ConflictDetector::new().detect(&intents);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].2, ConflictType::LiquidityRace);
+    }
+
+    #[test]
+    fn build_execution_plan_end_to_end() {
+        let intents = vec![
+            intent(0x01, 70, swap(1_000), 5),
+            intent(0x02, 85, backrun(), 5),
+            intent(0x03, 40, delta(), 5),
+        ];
+        let plan = build_execution_plan(intents, &dummy_state()).unwrap();
+        assert_eq!(plan.epoch, 5);
+        assert_eq!(plan.ordered_intents.len(), 3);
+        // Shapley weights sum to exactly 10000.
+        let sum: u32 = plan.shapley_weights.iter().map(|(_, w)| *w as u32).sum();
+        assert_eq!(sum, 10_000);
+        // Backrun must appear before DeltaHedge.
+        let mut saw_backrun = false;
+        for i in &plan.ordered_intents {
+            if matches!(i.action, Action::Backrun { .. }) {
+                saw_backrun = true;
+            }
+            if matches!(i.action, Action::DeltaHedge { .. }) {
+                assert!(saw_backrun, "δ appeared before β");
+            }
+        }
+    }
+
+    #[test]
+    fn plan_accepts_uniswap_pivot_actions() {
+        // One intent per new Uniswap-V4-native action variant. All must
+        // survive conflict detection and come out priority-sorted.
+        let migrate = Action::MigrateLiquidity {
+            from_pool: [0x11; 20],
+            to_pool: [0x22; 20],
+            amount: 200_000_000_000u128,
+            tick_lower: 200_400,
+            tick_upper: 203_400,
+        };
+        let set_fee = Action::SetDynamicFee {
+            pool: [0x33; 20],
+            new_fee_ppm: 6_000,
+        };
+        let hedge = Action::CrossProtocolHedge {
+            aave_borrow_asset: [0x44; 20],
+            aave_borrow_amount: 1_000_000,
+            uniswap_pool: [0x55; 20],
+            uniswap_token_in: [0x44; 20],
+            uniswap_token_out: [0x66; 20],
+            uniswap_amount_in: 1_000_000,
+        };
+        let intents = vec![
+            intent(0x01, 75, migrate, 9),
+            intent(0x02, 65, set_fee, 9),
+            intent(0x03, 85, hedge, 9),
+        ];
+        let plan = build_execution_plan(intents, &dummy_state()).unwrap();
+        assert_eq!(plan.ordered_intents.len(), 3);
+        // Priority-sort: hedge (85) before migrate (75) before set_fee (65).
+        assert!(matches!(
+            plan.ordered_intents[0].action,
+            Action::CrossProtocolHedge { .. }
+        ));
+        assert!(matches!(
+            plan.ordered_intents[1].action,
+            Action::MigrateLiquidity { .. }
+        ));
+        assert!(matches!(
+            plan.ordered_intents[2].action,
+            Action::SetDynamicFee { .. }
+        ));
+    }
+
+    #[test]
+    fn duplicate_set_dynamic_fee_on_same_pool_conflicts() {
+        let a = Action::SetDynamicFee {
+            pool: [0x99; 20],
+            new_fee_ppm: 3_000,
+        };
+        let b = Action::SetDynamicFee {
+            pool: [0x99; 20],
+            new_fee_ppm: 6_000,
+        };
+        let intents = vec![intent(0x01, 60, a, 9), intent(0x02, 60, b, 9)];
+        let err = build_execution_plan(intents, &dummy_state()).unwrap_err();
+        assert!(matches!(err, SolverError::UnresolvableConflict(_)));
+    }
+}
+
