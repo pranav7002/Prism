@@ -21,6 +21,7 @@ prism-solver = { path = "../prism-solver" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+tiny-keccak = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }

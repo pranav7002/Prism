@@ -369,17 +369,22 @@ pub async fn prove_epoch(
     Ok(aggregated)
 }
 
+/// Keccak hash of (epoch, intent_commitments, cooperative_mev_value).
+///
+/// Mirrors the solver-proof's intents-hash discipline (M1 in
+/// AUDIT_REPORT) — both sides keccak now, so the WS plan_hash event
+/// matches what the SP1 program commits and debugging the proof
+/// against the broadcast event is no longer misleading.
 fn hash_plan(plan: &prism_types::ExecutionPlan) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(plan.epoch.to_be_bytes());
+    use tiny_keccak::{Hasher, Keccak};
+    let mut h = Keccak::v256();
+    h.update(&plan.epoch.to_be_bytes());
     for i in &plan.ordered_intents {
-        h.update(i.commitment);
+        h.update(&i.commitment);
     }
-    h.update(plan.cooperative_mev_value.to_be_bytes());
-    let out = h.finalize();
+    h.update(&plan.cooperative_mev_value.to_be_bytes());
     let mut arr = [0u8; 32];
-    arr.copy_from_slice(&out);
+    h.finalize(&mut arr);
     arr
 }
 
