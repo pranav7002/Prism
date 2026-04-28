@@ -466,3 +466,273 @@ async fn run_execution_task(
     .await
 }
 
+async fn run_shapley_task(
+    config: &ProverConfig,
+    real_prover: Option<Arc<RealProver>>,
+    plan: prism_types::ExecutionPlan,
+    event_tx: broadcast::Sender<WsEvent>,
+) -> anyhow::Result<ChildProofArtifact> {
+    run_with_progress(config, "shapley", real_prover, event_tx, {
+        let plan = plan.clone();
+        move || Ok(ChildProofArtifact::mock_for(&plan.cooperative_mev_value.to_be_bytes()))
+    }, {
+        #[cfg(feature = "real-prover")]
+        {
+            let plan = plan.clone();
+            move |rp: Arc<RealProver>| -> anyhow::Result<ChildProofArtifact> {
+                // Match the solver's seed derivation in
+                // `prism-solver::monte_carlo_shapley`: epoch ^ 0xDEAD_BEEF_CAFE_BABE.
+                // The shapley program then re-XORs its argument inside, so we
+                // simply pass `plan.epoch` here and let the program do the XOR.
+                let random_seed: u64 = plan.epoch;
+                let num_samples: u32 = 1024;
+                let mev_value: u128 = plan.cooperative_mev_value;
+                let mut stdin = SP1Stdin::new();
+                stdin.write(&plan);
+                stdin.write(&mev_value);
+                stdin.write(&random_seed);
+                stdin.write(&num_samples);
+                let proof = rp
+                    .client
+                    .prove(&rp.shapley_pk, stdin)
+                    .compressed()
+                    .run()?;
+                let pv_bytes = proof.public_values.to_vec();
+                let mut pv = proof.public_values.clone();
+                let payouts: Vec<(AgentId, u128)> = pv.read();
+                let dist_hash: [u8; 32] = pv.read();
+                Ok(ChildProofArtifact {
+                    proof: Some(proof),
+                    vk_hash: rp.shapley_vk.hash_u32(),
+                    pv_bytes,
+                    proof_hash: dist_hash,
+                    epoch: plan.epoch,
+                    payouts,
+                    stub_bytes: Vec::new(),
+                })
+            }
+        }
+        #[cfg(not(feature = "real-prover"))]
+        {
+            let _ = plan;
+            move |_rp: Arc<RealProver>| -> anyhow::Result<ChildProofArtifact> {
+                unreachable!("real-prover path unreachable without feature")
+            }
+        }
+    })
+    .await
+}
+
+/// Emit 25/50/75/100 progress for `program`, run either the mock closure or
+/// the real-prover closure on a blocking thread, then emit `ProofComplete`
+/// with elapsed wall-clock time.
+async fn run_with_progress<MockF, RealF>(
+    config: &ProverConfig,
+    program: &'static str,
+    real_prover: Option<Arc<RealProver>>,
+    event_tx: broadcast::Sender<WsEvent>,
+    mock_work: MockF,
+    real_work: RealF,
+) -> anyhow::Result<ChildProofArtifact>
+where
+    MockF: FnOnce() -> anyhow::Result<ChildProofArtifact> + Send + 'static,
+    RealF: FnOnce(Arc<RealProver>) -> anyhow::Result<ChildProofArtifact> + Send + 'static,
+{
+    let start = std::time::Instant::now();
+    emit(&event_tx, program, 25);
+    emit(&event_tx, program, 50);
+
+    let result = match real_prover {
+        Some(rp) if !config.use_mock_prover => {
+            tokio::task::spawn_blocking(move || real_work(rp)).await??
+        }
+        _ => tokio::task::spawn_blocking(mock_work).await??,
+    };
+
+    emit(&event_tx, program, 75);
+    emit(&event_tx, program, 100);
+    let _ = event_tx.send(WsEvent::ProofComplete {
+        program: program.to_string(),
+        time_ms: start.elapsed().as_millis() as u64,
+    });
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Aggregator (real path)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "real-prover")]
+async fn run_aggregator_real(
+    rp: Arc<RealProver>,
+    solver: ChildProofArtifact,
+    execution: ChildProofArtifact,
+    shapley: ChildProofArtifact,
+) -> anyhow::Result<AggregatedProof> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<AggregatedProof> {
+        let mut stdin = SP1Stdin::new();
+
+        // Recursive STARK verification setup: write each child compressed
+        // proof + its VK so `verify_sp1_proof` inside the zkVM can succeed.
+        // We pair each compressed proof with the matching `vk.vk` (the inner
+        // StarkVerifyingKey<CoreSC>) — `write_proof` consumes both args.
+        macro_rules! write_child_proof {
+            ($label:literal, $artifact:ident, $vk:expr) => {{
+                let p = $artifact
+                    .proof
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!(concat!($label, ": child proof missing")))?;
+                let reduce = match &p.proof {
+                    SP1Proof::Compressed(boxed) => boxed.as_ref().clone(),
+                    _ => {
+                        return Err(anyhow::anyhow!(concat!(
+                            $label,
+                            ": child proof not Compressed — recursive verify requires `.compressed()`"
+                        )));
+                    }
+                };
+                stdin.write_proof(reduce, $vk.vk.clone());
+            }};
+        }
+        write_child_proof!("solver", solver, rp.solver_vk);
+        write_child_proof!("execution", execution, rp.execution_vk);
+        write_child_proof!("shapley", shapley, rp.shapley_vk);
+
+        // Now write the public inputs, in the exact order the aggregator
+        // program reads them:
+        //   solver_vkey, execution_vkey, shapley_vkey,
+        //   solver_pv_bytes, execution_pv_bytes, shapley_pv_bytes,
+        //   solver_intents_hash, solver_epoch,
+        //   exec_hash, exec_epoch,
+        //   shapley_dist_hash, shapley_epoch, shapley_payouts.
+        stdin.write(&solver.vk_hash);
+        stdin.write(&execution.vk_hash);
+        stdin.write(&shapley.vk_hash);
+
+        stdin.write(&solver.pv_bytes);
+        stdin.write(&execution.pv_bytes);
+        stdin.write(&shapley.pv_bytes);
+
+        stdin.write(&solver.proof_hash);
+        stdin.write(&solver.epoch);
+        stdin.write(&execution.proof_hash);
+        stdin.write(&execution.epoch);
+        stdin.write(&shapley.proof_hash);
+        stdin.write(&shapley.epoch);
+        stdin.write(&shapley.payouts);
+
+        // Final proof: Groth16 (260-byte on-chain shape).
+        let proof = rp
+            .client
+            .prove(&rp.aggregator_pk, stdin)
+            .groth16()
+            .run()?;
+
+        Ok(AggregatedProof {
+            proof_bytes: proof.bytes(),
+            public_values: Vec::new(),  // overwritten by caller
+            shapley_weights: Vec::new(), // overwritten by caller
+        })
+    })
+    .await?
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Deterministic 128-byte zeroed proof. The input is mixed into the first 16
+/// bytes via SHA-256 so different calls produce visibly different outputs,
+/// but the size is fixed at 128 to mirror Groth16 dimensions.
+pub fn mock_prove(inputs: &[&[u8]]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for chunk in inputs {
+        h.update(chunk);
+    }
+    let digest = h.finalize();
+
+    let mut out = vec![0u8; 128];
+    out[..16].copy_from_slice(&digest[..16]);
+    out
+}
+
+fn emit(tx: &broadcast::Sender<WsEvent>, program: &str, pct: u8) {
+    let _ = tx.send(WsEvent::ProofProgress {
+        program: program.to_string(),
+        pct,
+    });
+}
+
+/// ABI-encode `(uint256 epoch, uint16[] payouts)` matching the encoding
+/// expected by `PrismHook.settleEpoch`:
+///   `abi.decode(publicValues, (uint256, uint16[]))`
+///
+/// Layout (standard Solidity ABI, NOT packed):
+///   Word 0: epoch as uint256 (32 bytes, big-endian)
+///   Word 1: offset to dynamic array = 64 (0x40)
+///   Word 2: array length
+///   Words 3+: each uint16 left-padded to 32 bytes
+pub fn encode_public_values_abi(epoch: u64, payouts_bps: &[u16]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32 * (3 + payouts_bps.len()));
+
+    // uint256 epoch
+    let mut epoch_word = [0u8; 32];
+    epoch_word[24..32].copy_from_slice(&epoch.to_be_bytes());
+    buf.extend_from_slice(&epoch_word);
+
+    // offset to dynamic uint16[] data (always 64 = 0x40)
+    let mut offset_word = [0u8; 32];
+    offset_word[24..32].copy_from_slice(&64u64.to_be_bytes());
+    buf.extend_from_slice(&offset_word);
+
+    // array length
+    let mut len_word = [0u8; 32];
+    len_word[24..32].copy_from_slice(&(payouts_bps.len() as u64).to_be_bytes());
+    buf.extend_from_slice(&len_word);
+
+    // each uint16 element padded to 32 bytes
+    for &p in payouts_bps {
+        let mut word = [0u8; 32];
+        word[30..32].copy_from_slice(&p.to_be_bytes());
+        buf.extend_from_slice(&word);
+    }
+
+    buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abi_encode_matches_solidity_layout() {
+        let encoded = encode_public_values_abi(42, &[4000, 2500, 2000, 1500, 0]);
+        // 3 header words + 5 element words = 8 words = 256 bytes
+        assert_eq!(encoded.len(), 8 * 32);
+
+        // Word 0: epoch = 42
+        assert_eq!(encoded[31], 42);
+
+        // Word 1: offset = 64 (0x40)
+        assert_eq!(encoded[63], 0x40);
+
+        // Word 2: array length = 5
+        assert_eq!(encoded[95], 5);
+
+        // Word 3: first element = 4000 = 0x0FA0
+        assert_eq!(encoded[126], 0x0F);
+        assert_eq!(encoded[127], 0xA0);
+
+        // Word 7 (last element): 0
+        assert_eq!(encoded[7 * 32..8 * 32], [0u8; 32]);
+    }
+
+    #[test]
+    fn abi_encode_empty_payouts() {
+        let encoded = encode_public_values_abi(1, &[]);
+        // 3 header words, 0 elements = 96 bytes
+        assert_eq!(encoded.len(), 96);
+        assert_eq!(encoded[95], 0); // length = 0
+    }
+}
