@@ -642,13 +642,18 @@ async fn run_aggregator_real(
         write_child_proof!("execution", execution, rp.execution_vk);
         write_child_proof!("shapley", shapley, rp.shapley_vk);
 
-        // Now write the public inputs, in the exact order the aggregator
-        // program reads them:
+        // Public inputs in the order the aggregator program reads them:
         //   solver_vkey, execution_vkey, shapley_vkey,
         //   solver_pv_bytes, execution_pv_bytes, shapley_pv_bytes,
-        //   solver_intents_hash, solver_epoch,
-        //   exec_hash, exec_epoch,
-        //   shapley_dist_hash, shapley_epoch, shapley_payouts.
+        //   solver_epoch, exec_epoch, shapley_epoch,
+        //   payouts_bps.
+        //
+        // Hash anchors (intents_hash / exec_hash / dist_hash) are no
+        // longer passed — the aggregator now derives them from the
+        // trailing 32 bytes of each PV blob (closes H4). Each
+        // sub-program ends its commit stream with `commit(&[u8;32])`,
+        // and bincode of `[u8;32]` is exactly 32 raw bytes, so the
+        // last 32 bytes of pv_bytes are unambiguously the hash anchor.
         stdin.write(&solver.vk_hash);
         stdin.write(&execution.vk_hash);
         stdin.write(&shapley.vk_hash);
@@ -657,11 +662,8 @@ async fn run_aggregator_real(
         stdin.write(&execution.pv_bytes);
         stdin.write(&shapley.pv_bytes);
 
-        stdin.write(&solver.proof_hash);
         stdin.write(&solver.epoch);
-        stdin.write(&execution.proof_hash);
         stdin.write(&execution.epoch);
-        stdin.write(&shapley.proof_hash);
         stdin.write(&shapley.epoch);
         // Pass basis-point Shapley payouts; the aggregator program ABI-encodes
         // these into its committed public_values (replaces the prior

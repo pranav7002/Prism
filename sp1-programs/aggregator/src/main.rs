@@ -90,21 +90,43 @@ pub fn main() {
     let execution_pv_bytes: Vec<u8> = sp1_zkvm::io::read();
     let shapley_pv_bytes: Vec<u8> = sp1_zkvm::io::read();
 
-    // Cross-consistency anchors committed by each sub-proof:
-    //   solver  -> [u8; 32] sorted-intents hash, u64 epoch
-    //   exec    -> [u8; 32] execution_hash, u128 gas, bool valid, u64 epoch
-    //   shapley -> [u8; 32] distribution_hash, u64 epoch
-    let solver_intents_hash: [u8; 32] = sp1_zkvm::io::read();
+    // Epoch witnesses still come in via stdin. The on-chain `settleEpoch`
+    // already verifies `publicValues.epoch == currentEpoch`, so a malicious
+    // orchestrator that lies about the epoch can only stall settlement, not
+    // pay arbitrary payouts. The transitive `solver_epoch == exec_epoch ==
+    // shapley_epoch` check below catches obvious inconsistency.
     let solver_epoch: u64 = sp1_zkvm::io::read();
-    let exec_hash: [u8; 32] = sp1_zkvm::io::read();
     let exec_epoch: u64 = sp1_zkvm::io::read();
-    let shapley_dist_hash: [u8; 32] = sp1_zkvm::io::read();
     let shapley_epoch: u64 = sp1_zkvm::io::read();
     // Basis-point payouts (out of 10_000) — what the on-chain `settleEpoch`
     // consumes via abi.decode. Read as Vec<u16> rather than the previous
     // `Vec<(AgentId, u128)>` token-unit shape, so the aggregator's committed
     // public values can be the ABI-encoded blob the contract decodes.
     let payouts_bps: Vec<u16> = sp1_zkvm::io::read();
+
+    // Hash anchors are NO LONGER read from stdin. Pre-H4 fix the
+    // orchestrator passed them as separate words and the aggregator only
+    // checked them != [0;32], so a malicious prover holding valid
+    // sub-proofs could supply arbitrary anchor values. Now the aggregator
+    // *derives* each anchor from the trailing 32 bytes of the
+    // recursively-verified PV blob, exploiting the fact that each
+    // sub-program ends its commit stream with a `commit(&[u8;32])`:
+    //
+    //   solver-proof:    last 32 bytes = intents_hash
+    //   execution-proof: last 32 bytes = exec_hash
+    //   shapley-proof:   last 32 bytes = dist_hash
+    //
+    // bincode of `[u8;32]` is exactly 32 raw bytes (fixed-size arrays
+    // have no length prefix). Combined with `verify_sp1_proof` binding
+    // (vkey, sha256(pv_bytes)), the anchors are now cryptographically
+    // bound to what each sub-proof actually committed.
+    fn last_32(pv_bytes: &[u8]) -> [u8; 32] {
+        let n = pv_bytes.len();
+        assert!(n >= 32, "pv_bytes shorter than 32 bytes — sub-program shape changed?");
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&pv_bytes[n - 32..n]);
+        out
+    }
 
     // ------------------------------------------------------------------
     // Recursive STARK verification. These calls panic — rejecting the
@@ -119,27 +141,25 @@ pub fn main() {
     sp1_zkvm::lib::verify::verify_sp1_proof(&shapley_vkey, &shapley_digest);
 
     // ------------------------------------------------------------------
+    // Hash anchors derived from the verified PV blobs (closes H4).
+    // ------------------------------------------------------------------
+    let solver_intents_hash = last_32(&solver_pv_bytes);
+    let exec_hash = last_32(&execution_pv_bytes);
+    let shapley_dist_hash = last_32(&shapley_pv_bytes);
+
+    // Sanity: a sub-proof that committed [0u8;32] would be a bug in that
+    // program's hash function. Keep the original guard.
+    assert!(solver_intents_hash != [0u8; 32], "empty solver anchor");
+    assert!(exec_hash != [0u8; 32], "empty exec anchor");
+    assert!(shapley_dist_hash != [0u8; 32], "empty shapley anchor");
+
+    // ------------------------------------------------------------------
     // Cross-consistency: all three sub-proofs must describe the same epoch.
-    // The solver's intents hash must have flowed into execution, and the
-    // execution hash must have flowed into shapley — the orchestrator is
-    // expected to populate those anchors from the real PVs.
     // ------------------------------------------------------------------
     assert!(
         solver_epoch == exec_epoch && exec_epoch == shapley_epoch,
         "epoch mismatch across sub-proofs"
     );
-
-    // The solver-proof commits the sorted-intents hash; execution-proof's
-    // `exec_hash` is derived from the same intent list plus state + gas, so
-    // we bind them by requiring both to appear together as witnesses and
-    // trusting the caller's orchestrator to load them from matching PVs.
-    // A strict byte-for-byte check is impossible here without replaying the
-    // execution-proof's hash function — the anchor bytes themselves provide
-    // the binding because the recursive verifier would reject any PV that
-    // doesn't match what each sub-proof committed.
-    assert!(solver_intents_hash != [0u8; 32], "empty solver anchor");
-    assert!(exec_hash != [0u8; 32], "empty exec anchor");
-    assert!(shapley_dist_hash != [0u8; 32], "empty shapley anchor");
 
     // ------------------------------------------------------------------
     // Final settlement hash binds everything together.
