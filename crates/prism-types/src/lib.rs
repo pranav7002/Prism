@@ -1022,3 +1022,139 @@ mod tests {
                 amount: 0,
                 tick_lower: 0,
                 tick_upper: 0,
+            },
+            Action::BatchConsolidate {
+                removes: vec![],
+                adds: vec![],
+            },
+            Action::SetDynamicFee {
+                pool: [0; 20],
+                new_fee_ppm: 0,
+            },
+            Action::CrossProtocolHedge {
+                aave_borrow_asset: [0; 20],
+                aave_borrow_amount: 0,
+                uniswap_pool: [0; 20],
+                uniswap_token_in: [0; 20],
+                uniswap_token_out: [0; 20],
+                uniswap_amount_in: 0,
+            },
+            Action::KillSwitch {
+                reason: "".into(),
+            },
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for a in &actions {
+            assert!(seen.insert(a.discriminator()));
+        }
+        assert_eq!(actions.len(), 10);
+    }
+
+    #[test]
+    fn migrate_liquidity_roundtrips() {
+        let internal = AgentIntent::new_with_commitment(
+            AgentId([0xA1; 20]),
+            7,
+            "Uniswap".into(),
+            Action::MigrateLiquidity {
+                from_pool: [0x11; 20],
+                to_pool: [0x22; 20],
+                amount: 200_000_000_000u128,
+                tick_lower: 190_000,
+                tick_upper: 210_000,
+            },
+            75,
+            50,
+            [0x77; 32],
+        );
+        let wire: AgentIntentWire = (&internal).into();
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains(r#""type":"MigrateLiquidity""#), "got: {}", json);
+        let round = wire.to_internal().unwrap();
+        assert_eq!(round, internal);
+    }
+
+    #[test]
+    fn batch_consolidate_roundtrips_with_nested_vecs() {
+        let internal = AgentIntent::new_with_commitment(
+            AgentId([0xA2; 20]),
+            7,
+            "Uniswap".into(),
+            Action::BatchConsolidate {
+                removes: vec![
+                    ConsolidateRemove {
+                        pool: [0x11; 20],
+                        liquidity: 100,
+                    },
+                    ConsolidateRemove {
+                        pool: [0x22; 20],
+                        liquidity: 200,
+                    },
+                ],
+                adds: vec![ConsolidateAdd {
+                    pool: [0x33; 20],
+                    amount0: 1_000,
+                    amount1: 2_000,
+                    tick_lower: -100,
+                    tick_upper: 100,
+                }],
+            },
+            55,
+            50,
+            [0x88; 32],
+        );
+        let wire: AgentIntentWire = (&internal).into();
+        let round = wire.to_internal().unwrap();
+        assert_eq!(round, internal);
+    }
+
+    #[test]
+    fn cross_protocol_hedge_roundtrips() {
+        let internal = AgentIntent::new_with_commitment(
+            AgentId([0xA4; 20]),
+            7,
+            "Uniswap+Aave".into(),
+            Action::CrossProtocolHedge {
+                aave_borrow_asset: [0x11; 20],
+                aave_borrow_amount: 1_200_000_000_000_000_000u128,
+                uniswap_pool: [0x22; 20],
+                uniswap_token_in: [0x33; 20],
+                uniswap_token_out: [0x44; 20],
+                uniswap_amount_in: 1_200_000_000_000_000_000u128,
+            },
+            85,
+            50,
+            [0x99; 32],
+        );
+        let wire: AgentIntentWire = (&internal).into();
+        let round = wire.to_internal().unwrap();
+        assert_eq!(round, internal);
+    }
+
+    #[test]
+    fn swap_now_requires_pool_and_min_out() {
+        // Old-shape JSON (no `pool`) must fail to deserialize into the new
+        // ActionWire::Swap, preventing silent schema drift from Dev 3.
+        let old_shape = r#"{"type":"Swap","token_in":"0x1111111111111111111111111111111111111111","token_out":"0x2222222222222222222222222222222222222222","amount_in":"1000","min_out":"900"}"#;
+        assert!(serde_json::from_str::<ActionWire>(old_shape).is_err());
+    }
+
+    #[test]
+    fn set_dynamic_fee_roundtrips() {
+        let internal = AgentIntent::new_with_commitment(
+            AgentId([0xA5; 20]),
+            7,
+            "Uniswap".into(),
+            Action::SetDynamicFee {
+                pool: [0x11; 20],
+                new_fee_ppm: 6000,
+            },
+            65,
+            0,
+            [0xAB; 32],
+        );
+        let wire: AgentIntentWire = (&internal).into();
+        let round = wire.to_internal().unwrap();
+        assert_eq!(round, internal);
+    }
+}
