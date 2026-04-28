@@ -10,6 +10,7 @@
 //!     orchestrator parses them into `AgentIntent` and feeds them to the
 //!     solver. When no live intents arrive, mock intents are used.
 
+mod aave_client;
 mod mock_intents;
 mod proving;
 mod settlement;
@@ -19,7 +20,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
-use prism_types::{AgentIntent, AgentIntentWire, WsEvent};
+use prism_types::{AgentIntent, AgentIntentWire, ProtocolState, WsEvent};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
@@ -27,10 +28,11 @@ use tokio::time::{interval, Duration};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
+use crate::aave_client::AaveClient;
 use crate::mock_intents::{generate_mock_intents, scenario_for};
 use crate::proving::{prove_epoch, ProverConfig};
 use crate::settlement::SettlementConfig;
-use crate::uniswap_client::MockUniswapClient;
+use crate::uniswap_client::{MockUniswapClient, UniswapClient};
 
 // ---------------------------------------------------------------------------
 // Incoming intent message from agents (Dev 3's Python swarm)
@@ -59,10 +61,20 @@ pub struct OrchestratorConfig {
     pub epoch_duration_secs: u64,
     pub use_mock_prover: bool,
     pub uniswap_api_url: String,
+    /// Aave V3 Pool contract address. When `None`, the epoch loop uses
+    /// `aave_client::fallback_healthy()` (HF=2.0) instead of an RPC call.
+    pub aave_pool_address: Option<String>,
+    /// JSON-RPC endpoint for the chain Aave V3 is deployed on. Defaults to
+    /// `UNICHAIN_RPC_URL` for local dev, but production should point this at
+    /// Sepolia / OP Sepolia / mainnet (Aave is not on Unichain).
+    pub aave_rpc_url: String,
+    /// User account whose health factor we monitor. `None` ⇒ fallback.
+    pub aave_user_address: Option<String>,
 }
 
 impl OrchestratorConfig {
     pub fn from_env() -> Self {
+        let unichain_rpc = std::env::var("UNICHAIN_RPC_URL").unwrap_or_default();
         Self {
             ws_bind_addr: std::env::var("WS_BIND_ADDR")
                 .unwrap_or_else(|_| "0.0.0.0:8765".into()),
@@ -75,6 +87,9 @@ impl OrchestratorConfig {
                 .unwrap_or(true),
             uniswap_api_url: std::env::var("UNISWAP_API_URL")
                 .unwrap_or_else(|_| "https://api.uniswap.org".into()),
+            aave_pool_address: std::env::var("AAVE_POOL_ADDRESS").ok(),
+            aave_rpc_url: std::env::var("AAVE_RPC_URL").unwrap_or(unichain_rpc),
+            aave_user_address: std::env::var("AAVE_USER_ADDRESS").ok(),
         }
     }
 }
@@ -154,7 +169,14 @@ async fn run_epoch_loop(
     let mut epoch: u64 = 1;
 
     let pool_address = "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8";
-    let mock_market = MockUniswapClient;
+    let market = UniswapClient::new(&config.uniswap_api_url);
+    let mock_market = MockUniswapClient; // cold-start / hard-failure fallback
+    let mut last_known_state: Option<ProtocolState> = None;
+
+    let aave_client_opt: Option<AaveClient> = config
+        .aave_pool_address
+        .as_deref()
+        .map(|addr| AaveClient::new(&config.aave_rpc_url, addr));
 
     loop {
         tick.tick().await;
@@ -212,9 +234,48 @@ async fn run_epoch_loop(
             agents: agent_labels,
         });
 
-        let protocol_state = mock_market.get_pool_state(pool_address);
+        let protocol_state = match market.get_pool_state(pool_address).await {
+            Ok(s) => {
+                last_known_state = Some(s.clone());
+                s
+            }
+            Err(e) => {
+                warn!(
+                    "epoch {}: pool state fetch failed: {} — using fallback",
+                    epoch, e
+                );
+                last_known_state
+                    .clone()
+                    .unwrap_or_else(|| mock_market.get_pool_state(pool_address))
+            }
+        };
 
-        match prove_epoch(&prover, intents, protocol_state, event_tx.clone()).await {
+        let health = match (&aave_client_opt, &config.aave_user_address) {
+            (Some(aave), Some(user)) => aave.get_health_factor(user).await.unwrap_or_else(|e| {
+                warn!(
+                    "epoch {}: HF fetch failed: {} — falling back to healthy",
+                    epoch, e
+                );
+                aave_client::fallback_healthy()
+            }),
+            _ => aave_client::fallback_healthy(),
+        };
+
+        // `real_prover` arg for Agent B's new signature: always `None` from
+        // the orchestrator side. Construction lives behind the `real-prover`
+        // feature inside proving.rs (Agent B owns it). Passing `None` lets
+        // the call-site type-infer to whatever Option<Arc<RealProver>> Agent
+        // B's signature declares — works for both feature configurations.
+        match prove_epoch(
+            &prover,
+            None,
+            intents,
+            protocol_state,
+            health,
+            event_tx.clone(),
+        )
+        .await
+        {
             Ok(proof) => {
                 // Gas is constant O(1) — ~260k for the Groth16 pairing check
                 // plus small settlement logic.
@@ -283,3 +344,108 @@ fn mock_tx_hash(epoch: u64, proof_bytes: &[u8]) -> [u8; 32] {
     arr
 }
 
+// ---------------------------------------------------------------------------
+// WebSocket connection handler
+// ---------------------------------------------------------------------------
+
+async fn handle_ws_connection(
+    stream: tokio::net::TcpStream,
+    addr: SocketAddr,
+    mut rx: broadcast::Receiver<WsEvent>,
+    intent_tx: mpsc::Sender<AgentIntent>,
+) -> anyhow::Result<()> {
+    let ws_stream = tokio_tungstenite::accept_async(stream).await?;
+    info!("ws client connected: {}", addr);
+
+    let (mut ws_sink, mut ws_source) = ws_stream.split();
+
+    loop {
+        tokio::select! {
+            incoming = ws_source.next() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) | None => {
+                        info!("ws client disconnected: {}", addr);
+                        return Ok(());
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        ws_sink.send(Message::Pong(p)).await?;
+                    }
+                    Some(Ok(Message::Text(text))) => {
+                        handle_incoming_text(&text, addr, &intent_tx).await;
+                    }
+                    Some(Ok(_)) => {
+                        // Binary / other frames — ignore.
+                    }
+                    Some(Err(e)) => return Err(e.into()),
+                }
+            }
+            event = rx.recv() => {
+                match event {
+                    Ok(e) => {
+                        ws_sink.send(Message::Text(e.to_json())).await?;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("ws client {} lagged, dropped {} events", addr, n);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse an incoming text message from a WS client. If it's a valid
+/// `SubmitIntent`, convert the wire-format intent to an internal
+/// `AgentIntent` and push it into the mpsc channel for the epoch loop.
+async fn handle_incoming_text(
+    text: &str,
+    addr: SocketAddr,
+    intent_tx: &mpsc::Sender<AgentIntent>,
+) {
+    let msg: WsIncoming = match serde_json::from_str(text) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("ws {}: unparseable message: {}", addr, e);
+            return;
+        }
+    };
+
+    if msg.msg_type != "SubmitIntent" {
+        // Silently ignore non-intent messages (e.g. pings, heartbeats).
+        return;
+    }
+
+    let wire = match msg.intent {
+        Some(w) => w,
+        None => {
+            warn!("ws {}: SubmitIntent missing 'intent' field", addr);
+            return;
+        }
+    };
+
+    let agent_id = wire.agent_id.clone();
+    match wire.to_internal() {
+        Ok(internal) => {
+            if !internal.verify_commitment() {
+                warn!(
+                    "ws {}: intent from {} has invalid commitment — rejected",
+                    addr, agent_id
+                );
+                return;
+            }
+            info!(
+                "ws {}: accepted intent from agent {} (epoch={}, priority={})",
+                addr, agent_id, internal.epoch, internal.priority
+            );
+            if let Err(e) = intent_tx.send(internal).await {
+                error!("ws {}: intent channel send failed: {}", addr, e);
+            }
+        }
+        Err(e) => {
+            warn!("ws {}: invalid wire intent from {}: {}", addr, agent_id, e);
+        }
+    }
+}
