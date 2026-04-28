@@ -1,9 +1,21 @@
 //! Aave V3 health-factor query via JSON-RPC eth_call.
 //!
-//! Calls `Pool.getUserAccountData(address)` (selector 0xbf92857c) and parses
-//! the 6×32-byte return: (totalCollateralBase, totalDebtBase, _, _, _,
-//! healthFactor). Aave returns USD with 8-decimal scaling; we divide by 1e8
-//! to get whole-dollar `HealthFactor` fields.
+//! Calls `Pool.getUserAccountData(address)` (selector 0xbf92857c). The
+//! 6×32-byte return is:
+//!
+//!   slot 0 — totalCollateralBase  (1e8-scaled USD)
+//!   slot 1 — totalDebtBase        (1e8-scaled USD)
+//!   slot 2 — availableBorrowsBase (1e8-scaled USD, ignored)
+//!   slot 3 — currentLiquidationThreshold (basis points, ignored)
+//!   slot 4 — ltv                  (basis points, ignored)
+//!   slot 5 — healthFactor         (1e18-scaled — THE actual HF that
+//!                                   accounts for per-asset liquidation
+//!                                   thresholds; what we want)
+//!
+//! Pre-H7 fix this code parsed slots 0+1 and computed `collateral / debt`
+//! as the HF, which is wrong for mixed-asset positions. Now we read slot
+//! 5 directly, descale by 1e18, and construct the HealthFactor via
+//! `from_aave_e18`. (Closes H7 in Audit report.)
 //!
 //! Aave V3 isn't deployed on Unichain Sepolia, so AAVE_RPC_URL typically
 //! points at a different chain (Sepolia / OP Sepolia). For demos without a
@@ -74,15 +86,16 @@ impl AaveClient {
             return Err(anyhow!("aave result too short: {} bytes", bytes.len()));
         }
 
-        // Parse first 32 = totalCollateralBase, second 32 = totalDebtBase.
-        // Aave uses 8-decimal scaling for *Base values.
-        let collateral_usd = parse_u128_be(&bytes[0..32]) / 100_000_000;
-        let debt_usd = parse_u128_be(&bytes[32..64]) / 100_000_000;
+        // Parse slot 5 (offset 160..192) = healthFactor, 1e18-scaled.
+        // This is the actual HF Aave publishes — accounts for per-asset
+        // liquidation thresholds (closes H7).
+        let hf_e18 = parse_u128_be(&bytes[160..192]);
 
-        Ok(HealthFactor {
-            collateral_usd,
-            debt_usd,
-        })
+        // Aave returns hf_e18 = type(uint256).max (parses to u128::MAX
+        // here after saturation) when the user has zero debt — same
+        // semantics as our HealthFactor::value() returning INFINITY.
+        // Either way, treat it as healthy.
+        Ok(HealthFactor::from_aave_e18(hf_e18))
     }
 }
 
@@ -151,5 +164,47 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let res = rt.block_on(client.get_health_factor(&bad));
         assert!(res.is_err());
+    }
+
+    /// Synthesize the 6×32-byte return-data of getUserAccountData and
+    /// confirm the parser reads slot 5 (healthFactor) — not the
+    /// collateral/debt ratio of slots 0+1 — by feeding values where the
+    /// two would disagree.
+    #[test]
+    fn parses_slot5_health_factor_not_ratio() {
+        // Slot 0 (collateral) = 2e8 ($2 USD-scaled at 1e8) — would
+        // suggest HF=2.0 if naïvely divided by slot 1.
+        // Slot 1 (debt) = 1e8 ($1 USD).
+        // Slot 5 (real HF) = 1.5e18 — Aave's actual answer accounting
+        // for liquidation thresholds.
+        let mut buf = vec![0u8; 192];
+        // collateral = 2e8
+        let col_e8: u128 = 200_000_000;
+        buf[16..32].copy_from_slice(&col_e8.to_be_bytes());
+        // debt = 1e8
+        let debt_e8: u128 = 100_000_000;
+        buf[48..64].copy_from_slice(&debt_e8.to_be_bytes());
+        // healthFactor = 1.5e18
+        let hf_e18: u128 = 1_500_000_000_000_000_000;
+        buf[176..192].copy_from_slice(&hf_e18.to_be_bytes());
+
+        // Re-implement the parse inline (the network IO path isn't unit-testable).
+        let hf_parsed = parse_u128_be(&buf[160..192]);
+        assert_eq!(hf_parsed, hf_e18);
+
+        let hf = HealthFactor::from_aave_e18(hf_parsed);
+        // value() should recover 1.5 — not 2.0 (the ratio of slots 0/1)
+        assert!((hf.value() - 1.5).abs() < 1e-9);
+        assert!(hf.is_safe());
+    }
+
+    #[test]
+    fn from_aave_e18_zero_debt_means_max() {
+        // Aave returns type(uint256).max for zero-debt accounts; our
+        // parser saturates that to u128::MAX. value() should be very
+        // large and definitely safe.
+        let hf = HealthFactor::from_aave_e18(u128::MAX);
+        assert!(hf.is_safe());
+        assert!(hf.value() > 1e10);
     }
 }

@@ -351,6 +351,24 @@ impl HealthFactor {
     pub fn is_safe(&self) -> bool {
         self.value() > 1.05
     }
+
+    /// Construct a `HealthFactor` from Aave V3's actual `healthFactor`
+    /// return field (1e18-scaled). This is what slot 5 of
+    /// `getUserAccountData` returns — the *real* health factor that
+    /// accounts for per-asset liquidation thresholds, not the naive
+    /// `totalCollateralBase / totalDebtBase` ratio.
+    ///
+    /// Encodes the value so `value()` recovers the original HF without
+    /// changing the wire shape (closes H7 in Audit report). Field
+    /// names `collateral_usd` / `debt_usd` are kept for backward
+    /// compatibility but contain the e18-scaled numerator/denominator
+    /// rather than literal USD amounts when this constructor is used.
+    pub fn from_aave_e18(hf_e18: u128) -> Self {
+        Self {
+            collateral_usd: hf_e18,
+            debt_usd: 1_000_000_000_000_000_000, // 1e18
+        }
+    }
 }
 
 /// Request sent to the proving pipeline. Externally-tagged so bincode can
