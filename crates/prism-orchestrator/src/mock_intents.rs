@@ -266,3 +266,143 @@ fn opportunity_intents(epoch: u64) -> Vec<AgentIntent> {
         ),
     ]
 }
+
+fn crisis_intents(epoch: u64) -> Vec<AgentIntent> {
+    vec![
+        // α, β, γ, δ still submit but are suppressed by ε's kill-switch.
+        mk_intent(
+            0,
+            PREDICTIVE_LP,
+            epoch,
+            Action::RemoveLiquidity {
+                pool: POOL_USDC_WETH_030,
+                liquidity: 300_000_000_000u128,
+            },
+            95,
+            500,
+        ),
+        mk_intent(
+            1,
+            FEE_CURATOR,
+            epoch,
+            Action::SetDynamicFee {
+                pool: POOL_USDC_WETH_030,
+                new_fee_ppm: 10_000,
+            },
+            90,
+            500,
+        ),
+        mk_intent(
+            2,
+            FRAG_HEALER,
+            epoch,
+            Action::BatchConsolidate {
+                removes: vec![ConsolidateRemove {
+                    pool: POOL_USDC_WETH_030,
+                    liquidity: 200_000_000_000u128,
+                }],
+                adds: vec![ConsolidateAdd {
+                    pool: POOL_USDC_WETH_005,
+                    amount0: 200_000_000_000u128,
+                    amount1: 66_666_666_666_666_666_666u128,
+                    tick_lower: 190_000,
+                    tick_upper: 210_000,
+                }],
+            },
+            80,
+            500,
+        ),
+        mk_intent(
+            3,
+            BACKRUNNER,
+            epoch,
+            Action::Backrun {
+                target_tx: {
+                    let mut t = [0u8; 32];
+                    t[0] = 0xDE;
+                    t[1] = 0xAD;
+                    t[24..32].copy_from_slice(&epoch.to_be_bytes());
+                    t
+                },
+                profit_token: TOKEN_USDC,
+            },
+            92,
+            500,
+        ),
+        // ε Guardian — cross-protocol hedge THEN kill-switch. We bundle both
+        // as a single agent's intent chain by emitting two consecutive
+        // intents from the same agent (distinct salts).
+        mk_intent(
+            4,
+            GUARDIAN,
+            epoch,
+            Action::CrossProtocolHedge {
+                aave_borrow_asset: TOKEN_WETH,
+                aave_borrow_amount: 6_200_000_000_000_000_000u128,
+                uniswap_pool: POOL_USDC_WETH_030,
+                uniswap_token_in: TOKEN_WETH,
+                uniswap_token_out: TOKEN_USDC,
+                uniswap_amount_in: 6_200_000_000_000_000_000u128,
+            },
+            85,
+            100,
+        ),
+        // Kill switch (priority 100 overrides all).
+        mk_intent(
+            5,
+            GUARDIAN,
+            epoch,
+            Action::KillSwitch {
+                reason: "swarm_IL_exceeds_2.5%_threshold".into(),
+            },
+            100,
+            0,
+        ),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calm_epoch_generates_five_intents() {
+        let intents = generate_mock_intents(1);
+        assert_eq!(intents.len(), 5);
+        for i in &intents {
+            assert!(i.verify_commitment());
+        }
+    }
+
+    #[test]
+    fn opportunity_epoch_uses_migrate_liquidity() {
+        let intents = generate_mock_intents(2);
+        assert!(intents
+            .iter()
+            .any(|i| matches!(i.action, Action::MigrateLiquidity { .. })));
+    }
+
+    #[test]
+    fn crisis_epoch_has_kill_switch_and_hedge() {
+        let intents = generate_mock_intents(3);
+        assert!(intents
+            .iter()
+            .any(|i| matches!(i.action, Action::KillSwitch { .. })));
+        assert!(intents
+            .iter()
+            .any(|i| matches!(i.action, Action::CrossProtocolHedge { .. })));
+    }
+
+    #[test]
+    fn deterministic_across_calls() {
+        assert_eq!(generate_mock_intents(42), generate_mock_intents(42));
+    }
+
+    #[test]
+    fn scenario_labels() {
+        assert_eq!(scenario_for(1), "calm");
+        assert_eq!(scenario_for(2), "opportunity");
+        assert_eq!(scenario_for(3), "crisis");
+        assert_eq!(scenario_for(6), "crisis");
+    }
+}
