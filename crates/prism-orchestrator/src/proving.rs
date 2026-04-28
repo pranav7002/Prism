@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use prism_solver::build_execution_plan;
+use prism_solver::{build_execution_plan, ConflictDetector, SolverError};
 use prism_types::{AgentId, AgentIntent, HealthFactor, ProtocolState, WsEvent};
 use tokio::sync::broadcast;
 use tracing::info;
@@ -210,12 +210,35 @@ pub async fn prove_epoch(
     health_factor: HealthFactor,
     event_tx: broadcast::Sender<WsEvent>,
 ) -> anyhow::Result<AggregatedProof> {
-    // Solver phase.
+    // Solver phase. Detect conflicts ahead of build_execution_plan so the
+    // SolverRunning event carries the real count (H3) and any unresolvable
+    // conflict surfaces structurally rather than as a flat anyhow string
+    // (H2). build_execution_plan re-detects internally — this duplicates the
+    // O(n²) scan but n ≤ 10 in practice.
+    let pre_conflicts = ConflictDetector::new().detect(&intents);
     let _ = event_tx.send(WsEvent::SolverRunning {
-        conflicts_detected: 0,
+        conflicts_detected: pre_conflicts.len() as u32,
     });
-    let plan = build_execution_plan(intents.clone(), &protocol_state)
-        .map_err(|e| anyhow::anyhow!("solver failed: {}", e))?;
+
+    let plan = match build_execution_plan(intents.clone(), &protocol_state) {
+        Ok(p) => p,
+        Err(SolverError::UnresolvableConflict(kinds)) => {
+            // Emit the dropped-intent list before bubbling the error so the
+            // frontend renders the failed-plan moment instead of a silent
+            // SolverComplete{ dropped: [] } (H2).
+            let dropped: Vec<String> = kinds.iter().map(|k| format!("{:?}", k)).collect();
+            let _ = event_tx.send(WsEvent::SolverComplete {
+                plan_hash: "0x0000000000000000000000000000000000000000000000000000000000000000".into(),
+                dropped: dropped.clone(),
+            });
+            return Err(anyhow::anyhow!(
+                "solver: unresolvable conflicts: {:?}",
+                kinds
+            ));
+        }
+        Err(e) => return Err(anyhow::anyhow!("solver failed: {}", e)),
+    };
+
     let plan_hash = hash_plan(&plan);
     let _ = event_tx.send(WsEvent::SolverComplete {
         plan_hash: format!("0x{}", hex::encode(plan_hash)),
