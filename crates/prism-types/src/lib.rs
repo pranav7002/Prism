@@ -732,3 +732,293 @@ impl From<&AgentIntent> for AgentIntentWire {
 
 impl From<&Action> for ActionWire {
     fn from(a: &Action) -> Self {
+        match a {
+            Action::Swap {
+                pool,
+                token_in,
+                token_out,
+                amount_in,
+                min_out,
+            } => ActionWire::Swap {
+                pool: encode_hex(pool),
+                token_in: encode_hex(token_in),
+                token_out: encode_hex(token_out),
+                amount_in: amount_in.to_string(),
+                min_out: min_out.to_string(),
+            },
+            Action::AddLiquidity {
+                pool,
+                amount0,
+                amount1,
+                tick_lower,
+                tick_upper,
+            } => ActionWire::AddLiquidity {
+                pool: encode_hex(pool),
+                amount0: amount0.to_string(),
+                amount1: amount1.to_string(),
+                tick_lower: *tick_lower,
+                tick_upper: *tick_upper,
+            },
+            Action::RemoveLiquidity { pool, liquidity } => ActionWire::RemoveLiquidity {
+                pool: encode_hex(pool),
+                liquidity: liquidity.to_string(),
+            },
+            Action::Backrun {
+                target_tx,
+                profit_token,
+            } => ActionWire::Backrun {
+                target_tx: encode_hex(target_tx),
+                profit_token: encode_hex(profit_token),
+            },
+            Action::DeltaHedge { position_id, delta } => ActionWire::DeltaHedge {
+                position_id: *position_id,
+                delta: *delta,
+            },
+            Action::MigrateLiquidity {
+                from_pool,
+                to_pool,
+                amount,
+                tick_lower,
+                tick_upper,
+            } => ActionWire::MigrateLiquidity {
+                from_pool: encode_hex(from_pool),
+                to_pool: encode_hex(to_pool),
+                amount: amount.to_string(),
+                tick_lower: *tick_lower,
+                tick_upper: *tick_upper,
+            },
+            Action::BatchConsolidate { removes, adds } => ActionWire::BatchConsolidate {
+                removes: removes
+                    .iter()
+                    .map(|r| ConsolidateRemoveWire {
+                        pool: encode_hex(&r.pool),
+                        liquidity: r.liquidity.to_string(),
+                    })
+                    .collect(),
+                adds: adds
+                    .iter()
+                    .map(|a| ConsolidateAddWire {
+                        pool: encode_hex(&a.pool),
+                        amount0: a.amount0.to_string(),
+                        amount1: a.amount1.to_string(),
+                        tick_lower: a.tick_lower,
+                        tick_upper: a.tick_upper,
+                    })
+                    .collect(),
+            },
+            Action::SetDynamicFee { pool, new_fee_ppm } => ActionWire::SetDynamicFee {
+                pool: encode_hex(pool),
+                new_fee_ppm: *new_fee_ppm,
+            },
+            Action::CrossProtocolHedge {
+                aave_borrow_asset,
+                aave_borrow_amount,
+                uniswap_pool,
+                uniswap_token_in,
+                uniswap_token_out,
+                uniswap_amount_in,
+            } => ActionWire::CrossProtocolHedge {
+                aave_borrow_asset: encode_hex(aave_borrow_asset),
+                aave_borrow_amount: aave_borrow_amount.to_string(),
+                uniswap_pool: encode_hex(uniswap_pool),
+                uniswap_token_in: encode_hex(uniswap_token_in),
+                uniswap_token_out: encode_hex(uniswap_token_out),
+                uniswap_amount_in: uniswap_amount_in.to_string(),
+            },
+            Action::KillSwitch { reason } => ActionWire::KillSwitch {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_intent() -> AgentIntent {
+        AgentIntent::new_with_commitment(
+            AgentId([0xAA; 20]),
+            42,
+            "Uniswap".into(),
+            Action::Swap {
+                pool: [0xDD; 20],
+                token_in: [0x11; 20],
+                token_out: [0x22; 20],
+                amount_in: 1_000_000_000_000_000_000u128,
+                min_out: 330_000_000_000_000_000u128,
+            },
+            80,
+            50,
+            [0x55; 32],
+        )
+    }
+
+    #[test]
+    fn commitment_is_deterministic() {
+        let a = sample_intent();
+        let b = sample_intent();
+        assert_eq!(a.commitment, b.commitment);
+        assert!(a.verify_commitment());
+    }
+
+    #[test]
+    fn commitment_changes_with_salt() {
+        let a = sample_intent();
+        let mut b = a.clone();
+        b.salt = [0x66; 32];
+        b.commitment = b.compute_commitment();
+        assert_ne!(a.commitment, b.commitment);
+    }
+
+    #[test]
+    fn health_factor_thresholds() {
+        let safe = HealthFactor {
+            collateral_usd: 2_000_000,
+            debt_usd: 1_000_000,
+        };
+        assert!((safe.value() - 2.0).abs() < 1e-9);
+        assert!(safe.is_safe());
+
+        let borderline = HealthFactor {
+            collateral_usd: 1_040_000,
+            debt_usd: 1_000_000,
+        };
+        assert!(!borderline.is_safe());
+
+        let zero_debt = HealthFactor {
+            collateral_usd: 1,
+            debt_usd: 0,
+        };
+        assert!(zero_debt.value().is_infinite());
+        assert!(zero_debt.is_safe());
+    }
+
+    #[test]
+    fn ws_event_json_shape() {
+        let e = WsEvent::ProofProgress {
+            program: "solver".into(),
+            pct: 75,
+        };
+        let s = e.to_json();
+        assert!(s.contains(r#""type":"proof_progress""#));
+        assert!(s.contains(r#""program":"solver""#));
+        assert!(s.contains(r#""pct":75"#));
+
+        let round: WsEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(round, e);
+    }
+
+    #[test]
+    fn action_json_is_externally_tagged() {
+        // Dev 3 documented JSON shape: {"Swap": {...}}. Externally-tagged
+        // (serde default) is required because bincode — used by the SP1
+        // zkVM — cannot deserialize internally-tagged enums.
+        let a = Action::Swap {
+            pool: [0xDD; 20],
+            token_in: [0x11; 20],
+            token_out: [0x22; 20],
+            amount_in: 1_000_000,
+            min_out: 990_000,
+        };
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(s.starts_with(r#"{"Swap":{"pool":"#), "shape was: {}", s);
+        let round: Action = serde_json::from_str(&s).unwrap();
+        assert_eq!(round, a);
+    }
+
+    #[test]
+    fn ws_event_epoch_settled_roundtrip() {
+        let e = WsEvent::EpochSettled {
+            tx_hash: "0xabcd".into(),
+            gas_used: 260_000,
+            shapley: vec![4000, 2500, 2000, 1500, 0],
+        };
+        let s = e.to_json();
+        assert!(s.contains(r#""type":"epoch_settled""#));
+        assert!(s.contains(r#""gas_used":260000"#));
+        let round: WsEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(round, e);
+    }
+
+    #[test]
+    fn ws_event_all_dev3_variants_roundtrip() {
+        let cases: Vec<WsEvent> = vec![
+            WsEvent::EpochStart { epoch: 5, timestamp: 1719000000 },
+            WsEvent::IntentsReceived { count: 5, agents: vec!["α".into(), "β".into()] },
+            WsEvent::SolverRunning { conflicts_detected: 2 },
+            WsEvent::SolverComplete { plan_hash: "0xabcd".into(), dropped: vec!["ε".into()] },
+            WsEvent::ProofComplete { program: "solver".into(), time_ms: 30_000 },
+            WsEvent::AggregationStart,
+            WsEvent::AggregationComplete { time_ms: 60_000 },
+            WsEvent::Groth16Wrapping { pct: 50 },
+        ];
+        for e in cases {
+            let s = e.to_json();
+            let round: WsEvent = serde_json::from_str(&s).unwrap();
+            assert_eq!(round, e, "roundtrip failed for {:?}", e);
+        }
+    }
+
+    #[test]
+    fn wire_intent_roundtrips_are_now_lossless() {
+        // With the Uniswap V4 pivot, Swap carries `pool` + `min_out` in both
+        // wire and internal forms. The wire↔internal conversion is now fully
+        // lossless — commitment must survive byte-for-byte.
+        let internal = sample_intent();
+        let wire: AgentIntentWire = (&internal).into();
+        assert!(wire.agent_id.starts_with("0x"));
+        assert_eq!(wire.agent_id.len(), 2 + 40);
+        assert!(wire.salt.starts_with("0x"));
+        assert_eq!(wire.salt.len(), 2 + 64);
+        assert!(matches!(wire.action, ActionWire::Swap { .. }));
+
+        let round = wire.to_internal().unwrap();
+        assert_eq!(round, internal);
+    }
+
+    #[test]
+    fn wire_intent_type_tag_is_pascal_case() {
+        let internal = sample_intent();
+        let wire: AgentIntentWire = (&internal).into();
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(json.contains(r#""type":"Swap""#), "got: {}", json);
+        assert!(json.contains(r#""agent_id":"0xaaaaaaaa"#), "got: {}", json);
+        assert!(json.contains(r#""amount_in":"1000000000000000000""#), "got: {}", json);
+    }
+
+    #[test]
+    fn action_discriminators_are_unique() {
+        let actions = [
+            Action::Swap {
+                pool: [0; 20],
+                token_in: [0; 20],
+                token_out: [0; 20],
+                amount_in: 0,
+                min_out: 0,
+            },
+            Action::AddLiquidity {
+                pool: [0; 20],
+                amount0: 0,
+                amount1: 0,
+                tick_lower: 0,
+                tick_upper: 0,
+            },
+            Action::RemoveLiquidity {
+                pool: [0; 20],
+                liquidity: 0,
+            },
+            Action::Backrun {
+                target_tx: [0; 32],
+                profit_token: [0; 20],
+            },
+            Action::DeltaHedge {
+                position_id: 0,
+                delta: 0,
+            },
+            Action::MigrateLiquidity {
+                from_pool: [0; 20],
+                to_pool: [0; 20],
+                amount: 0,
+                tick_lower: 0,
+                tick_upper: 0,
