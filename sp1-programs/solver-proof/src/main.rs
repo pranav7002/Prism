@@ -212,3 +212,167 @@ impl Action {
         }
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct AgentIntent {
+    agent_id: AgentId,
+    epoch: u64,
+    target_protocol: String,
+    action: Action,
+    priority: u8,
+    max_slippage_bps: u16,
+    salt: [u8; 32],
+    commitment: [u8; 32],
+}
+
+impl AgentIntent {
+    fn compute_commitment(&self) -> [u8; 32] {
+        let mut buf: Vec<u8> = Vec::with_capacity(128);
+        buf.extend_from_slice(&self.agent_id.0);
+        buf.extend_from_slice(&self.epoch.to_be_bytes());
+        let proto = self.target_protocol.as_bytes();
+        buf.extend_from_slice(&(proto.len() as u32).to_be_bytes());
+        buf.extend_from_slice(proto);
+        self.action.encode_packed(&mut buf);
+        buf.push(self.priority);
+        buf.extend_from_slice(&self.max_slippage_bps.to_be_bytes());
+        buf.extend_from_slice(&self.salt);
+
+        let mut hasher = Keccak::v256();
+        hasher.update(&buf);
+        let mut out = [0u8; 32];
+        hasher.finalize(&mut out);
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ExecutionPlan {
+    epoch: u64,
+    ordered_intents: Vec<AgentIntent>,
+    cooperative_mev_value: u128,
+    shapley_weights: Vec<(AgentId, u16)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct ProtocolState {
+    pool_address: [u8; 20],
+    sqrt_price_x96: u128,
+    liquidity: u128,
+    tick: i32,
+    fee_tier: u32,
+    token0_reserve: u128,
+    token1_reserve: u128,
+    volatility_30d_bps: u32,
+}
+
+// ----------------------------------------------------------------------------
+
+fn hash_intents(intents: &[AgentIntent]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    for intent in intents {
+        h.update(intent.agent_id.0);
+        h.update(intent.epoch.to_be_bytes());
+        h.update([intent.priority]);
+        h.update(intent.commitment);
+    }
+    let out = h.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&out);
+    arr
+}
+
+fn is_backrun(a: &Action) -> bool {
+    matches!(a, Action::Backrun { .. })
+}
+
+fn is_delta(a: &Action) -> bool {
+    matches!(a, Action::DeltaHedge { .. })
+}
+
+fn is_killswitch(a: &Action) -> bool {
+    matches!(a, Action::KillSwitch { .. })
+}
+
+pub fn main() {
+    let input_intents: Vec<AgentIntent> = sp1_zkvm::io::read();
+    let _protocol_state: ProtocolState = sp1_zkvm::io::read();
+    let plan: ExecutionPlan = sp1_zkvm::io::read();
+
+    // Constraint 1: commitment binding.
+    for intent in &input_intents {
+        assert!(
+            intent.compute_commitment() == intent.commitment,
+            "commitment mismatch"
+        );
+    }
+
+    // Constraint 2: no fabrication. Plan contains exactly the same
+    // multiset of intents (by commitment hash) as the input.
+    assert!(
+        plan.ordered_intents.len() == input_intents.len(),
+        "plan len != input len"
+    );
+    {
+        let mut input_commitments: Vec<[u8; 32]> =
+            input_intents.iter().map(|i| i.commitment).collect();
+        let mut plan_commitments: Vec<[u8; 32]> =
+            plan.ordered_intents.iter().map(|i| i.commitment).collect();
+        input_commitments.sort();
+        plan_commitments.sort();
+        assert!(
+            input_commitments == plan_commitments,
+            "plan intents != input intents"
+        );
+    }
+
+    // Constraint 5: KillSwitch-first.
+    let has_killswitch = plan
+        .ordered_intents
+        .iter()
+        .any(|i| is_killswitch(&i.action));
+    if has_killswitch {
+        assert!(
+            is_killswitch(&plan.ordered_intents[0].action),
+            "KillSwitch must be first"
+        );
+    }
+
+    // Constraint 3: priority ordering, with two carve-outs: (a) KillSwitch
+    // sits ahead of higher-priority items legitimately; (b) β-before-δ may
+    // place a Backrun immediately before a strictly-higher-priority
+    // DeltaHedge.
+    for i in 0..plan.ordered_intents.len().saturating_sub(1) {
+        let a = &plan.ordered_intents[i];
+        let b = &plan.ordered_intents[i + 1];
+
+        // Skip the KillSwitch first-slot carve-out.
+        if i == 0 && is_killswitch(&a.action) {
+            continue;
+        }
+
+        if a.priority >= b.priority {
+            continue;
+        }
+
+        // Priority inversion — must be justified by β-before-δ.
+        let inversion_ok = is_backrun(&a.action) && is_delta(&b.action);
+        assert!(inversion_ok, "unauthorized priority inversion at index {}", i);
+    }
+
+    // Constraint 4: Backrun target_tx is non-zero.
+    for intent in &plan.ordered_intents {
+        if let Action::Backrun { target_tx, .. } = &intent.action {
+            assert!(
+                target_tx.iter().any(|b| *b != 0),
+                "Backrun target_tx is zero"
+            );
+        }
+    }
+
+    // Commit outputs: the validated plan + a cross-consistency hash of the
+    // sorted intents list.
+    let intents_hash = hash_intents(&plan.ordered_intents);
+    sp1_zkvm::io::commit(&plan);
+    sp1_zkvm::io::commit(&intents_hash);
+}
