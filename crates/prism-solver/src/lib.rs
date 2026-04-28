@@ -715,5 +715,72 @@ mod tests {
         let err = build_execution_plan(intents, &dummy_state()).unwrap_err();
         assert!(matches!(err, SolverError::UnresolvableConflict(_)));
     }
-}
 
+    // -----------------------------------------------------------------------
+    // Monte Carlo Shapley tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn shapley_higher_priority_gets_more_weight() {
+        // Agent 0x01 has priority 90, 0x02 has 10. Shapley should reflect that.
+        let intents = vec![
+            intent(0x01, 90, swap(1_000), 1),
+            intent(0x02, 10, swap(2_000), 1),
+        ];
+        let weights = monte_carlo_shapley(&intents, 42);
+        assert_eq!(weights.len(), 2);
+        let sum: u32 = weights.iter().map(|(_, w)| *w as u32).sum();
+        assert_eq!(sum, 10_000, "efficiency axiom violated");
+        // Agent with priority 90 should get ~9000 bps.
+        let w0 = weights[0].1;
+        let w1 = weights[1].1;
+        assert!(
+            w0 > w1,
+            "priority-90 agent ({} bps) should outweigh priority-10 agent ({} bps)",
+            w0, w1
+        );
+        // Within 5% tolerance of exact proportional split (9000/1000).
+        assert!(w0 >= 8500, "priority-90 agent got only {} bps", w0);
+        assert!(w1 <= 1500, "priority-10 agent got {} bps", w1);
+    }
+
+    #[test]
+    fn shapley_is_deterministic() {
+        let intents = vec![
+            intent(0x01, 70, swap(1_000), 1),
+            intent(0x02, 50, swap(2_000), 1),
+            intent(0x03, 30, swap(3_000), 1),
+        ];
+        let w1 = monte_carlo_shapley(&intents, 99);
+        let w2 = monte_carlo_shapley(&intents, 99);
+        assert_eq!(w1, w2, "same seed must produce identical weights");
+    }
+
+    #[test]
+    fn shapley_equal_priorities_give_equal_weights() {
+        let intents = vec![
+            intent(0x01, 50, swap(1_000), 1),
+            intent(0x02, 50, swap(2_000), 1),
+            intent(0x03, 50, swap(3_000), 1),
+        ];
+        let weights = monte_carlo_shapley(&intents, 7);
+        let sum: u32 = weights.iter().map(|(_, w)| *w as u32).sum();
+        assert_eq!(sum, 10_000);
+        // Each agent should get ~3333 bps. Allow rounding dust.
+        for (_, w) in &weights {
+            assert!(
+                *w >= 3300 && *w <= 3400,
+                "equal-priority agent got {} bps (expected ~3333)",
+                w
+            );
+        }
+    }
+
+    #[test]
+    fn shapley_single_agent_gets_all() {
+        let intents = vec![intent(0x01, 50, swap(1_000), 1)];
+        let weights = monte_carlo_shapley(&intents, 1);
+        assert_eq!(weights.len(), 1);
+        assert_eq!(weights[0].1, 10_000);
+    }
+}
