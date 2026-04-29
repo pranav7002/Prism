@@ -31,7 +31,12 @@ contract PrismHookTest is Test {
     function setUp() public {
         verifier = new MockSP1Verifier();
         aave = new MockAave();
-        hook = new PrismHook(IPoolManager(POOL_MANAGER), verifier, MOCK_VKEY, address(this));
+        hook = new PrismHook(
+            IPoolManager(POOL_MANAGER),
+            verifier,
+            MOCK_VKEY,
+            address(this)
+        );
 
         // Register 5 agents with appropriate capabilities.
         hook.registerAgent(
