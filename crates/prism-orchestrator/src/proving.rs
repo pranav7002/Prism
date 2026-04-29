@@ -75,6 +75,7 @@ pub struct ProverConfig {
     pub execution_elf: &'static [u8],
     #[allow(dead_code)]
     pub shapley_elf: &'static [u8],
+    #[allow(dead_code)]
     pub aggregator_elf: &'static [u8],
 }
 
@@ -160,6 +161,10 @@ pub struct RealProver;
 // ChildProofArtifact: shared shape for both mock + real paths.
 // ---------------------------------------------------------------------------
 
+// Fields below are read only on the real-prover code path. The default
+// `mock-elf` build never reaches that code, so rustc flags them as dead
+// — silence at the struct level.
+#[cfg_attr(not(feature = "real-prover"), allow(dead_code))]
 struct ChildProofArtifact {
     /// The actual SDK proof. `None` on the mock path.
     #[cfg(feature = "real-prover")]
@@ -178,7 +183,6 @@ struct ChildProofArtifact {
     payouts: Vec<(AgentId, u128)>,
     /// Stub bytes — only populated on mock path so the existing tests + the
     /// non-recursive sanity checks still see "something".
-    #[allow(dead_code)]
     stub_bytes: Vec<u8>,
 }
 
@@ -522,17 +526,19 @@ async fn run_shapley_task(
             let plan = plan.clone();
             move |rp: Arc<RealProver>| -> anyhow::Result<ChildProofArtifact> {
                 // Match the solver's seed derivation in
-                // `prism-solver::monte_carlo_shapley`: epoch ^ 0xDEAD_BEEF_CAFE_BABE.
-                // The shapley program then re-XORs its argument inside, so we
-                // simply pass `plan.epoch` here and let the program do the XOR.
+                // `prism-solver::priority_weighted_split`: epoch ^
+                // 0xDEAD_BEEF_CAFE_BABE. The shapley program re-XORs its
+                // argument inside, so we pass `plan.epoch` and let the
+                // program do the XOR.
                 let random_seed: u64 = plan.epoch;
-                // Must equal `prism_solver::SHAPLEY_NUM_SAMPLES` — diverging values
-                // produce different Shapley vectors off-chain vs in-circuit.
+                // Must equal `prism_solver::SHAPLEY_NUM_SAMPLES` — diverging
+                // values produce different vectors off-chain vs in-circuit.
                 let num_samples: u32 = prism_solver::SHAPLEY_NUM_SAMPLES;
-                let mev_value: u128 = plan.cooperative_mev_value;
+                // M3: the prior shapley-proof read a `mev_value: u128` and
+                // discarded it. That stdin write is removed in lockstep
+                // with the program's stdin read.
                 let mut stdin = SP1Stdin::new();
                 stdin.write(&plan);
-                stdin.write(&mev_value);
                 stdin.write(&random_seed);
                 stdin.write(&num_samples);
                 let proof = rp
@@ -718,41 +724,25 @@ fn emit(tx: &broadcast::Sender<WsEvent>, program: &str, pct: u8) {
     });
 }
 
-/// ABI-encode `(uint256 epoch, uint16[] payouts)` matching the encoding
+/// ABI-encode `(uint256 epoch, uint16[] payouts)` matching the shape
 /// expected by `PrismHook.settleEpoch`:
 ///   `abi.decode(publicValues, (uint256, uint16[]))`
 ///
-/// Layout (standard Solidity ABI, NOT packed):
-///   Word 0: epoch as uint256 (32 bytes, big-endian)
-///   Word 1: offset to dynamic array = 64 (0x40)
-///   Word 2: array length
-///   Words 3+: each uint16 left-padded to 32 bytes
+/// Pre-M12 fix this was a hand-rolled byte-shifter with the dynamic
+/// array offset `0x40` hardcoded — adding a third tuple field would
+/// silently misalign the Solidity decode. Now goes through
+/// `alloy_sol_types`, which derives the offset from the tuple shape
+/// at compile time.
+///
+/// Output is byte-identical to the previous implementation; the two
+/// existing golden-vector tests below pin that.
 pub fn encode_public_values_abi(epoch: u64, payouts_bps: &[u16]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(32 * (3 + payouts_bps.len()));
+    use alloy_primitives::U256;
+    use alloy_sol_types::SolValue;
 
-    // uint256 epoch
-    let mut epoch_word = [0u8; 32];
-    epoch_word[24..32].copy_from_slice(&epoch.to_be_bytes());
-    buf.extend_from_slice(&epoch_word);
-
-    // offset to dynamic uint16[] data (always 64 = 0x40)
-    let mut offset_word = [0u8; 32];
-    offset_word[24..32].copy_from_slice(&64u64.to_be_bytes());
-    buf.extend_from_slice(&offset_word);
-
-    // array length
-    let mut len_word = [0u8; 32];
-    len_word[24..32].copy_from_slice(&(payouts_bps.len() as u64).to_be_bytes());
-    buf.extend_from_slice(&len_word);
-
-    // each uint16 element padded to 32 bytes
-    for &p in payouts_bps {
-        let mut word = [0u8; 32];
-        word[30..32].copy_from_slice(&p.to_be_bytes());
-        buf.extend_from_slice(&word);
-    }
-
-    buf
+    let payouts: Vec<u16> = payouts_bps.to_vec();
+    let value: (U256, Vec<u16>) = (U256::from(epoch), payouts);
+    value.abi_encode_params()
 }
 
 #[cfg(test)]
@@ -780,6 +770,110 @@ mod tests {
 
         // Word 7 (last element): 0
         assert_eq!(encoded[7 * 32..8 * 32], [0u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn prove_epoch_mock_path_emits_full_event_sequence() {
+        // End-to-end smoke test: drive prove_epoch with mock intents +
+        // mock prover, assert the WS event sequence matches what the
+        // frontend expects to consume. Catches regressions across solver
+        // / proving / aggregation / Groth16-wrap progression in one shot.
+        // (Phase 5.1 in commit plan.)
+        use crate::mock_intents::generate_mock_intents;
+        use prism_types::{HealthFactor, ProtocolState, WsEvent};
+        use tokio::sync::broadcast;
+
+        let (tx, mut rx) = broadcast::channel::<WsEvent>(256);
+
+        let intents = generate_mock_intents(1); // calm scenario
+        let n_intents = intents.len();
+        let state = ProtocolState {
+            pool_address: [0xDD; 20],
+            sqrt_price_x96: 1,
+            liquidity: 1_000_000,
+            tick: 0,
+            fee_tier: 3_000,
+            token0_reserve: 1_000_000_000_000,
+            token1_reserve: 1_000_000_000_000,
+            volatility_30d_bps: 1_500,
+        };
+        let health = HealthFactor::from_aave_e18(2_000_000_000_000_000_000); // HF=2.0
+        let cfg = ProverConfig::from_compiled(true);
+
+        let result = prove_epoch(&cfg, None, intents, state, health, tx.clone()).await;
+        let agg = result.expect("prove_epoch failed");
+
+        // Drop sender so try_recv eventually returns Closed (not Empty).
+        drop(tx);
+
+        let mut events: Vec<WsEvent> = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => events.push(ev),
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Closed) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            }
+        }
+
+        assert!(!events.is_empty(), "no events captured");
+
+        // Tag-only summary for ordering assertions.
+        let tags: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                WsEvent::SolverRunning { .. } => "SolverRunning",
+                WsEvent::SolverComplete { .. } => "SolverComplete",
+                WsEvent::ProofProgress { .. } => "ProofProgress",
+                WsEvent::ProofComplete { .. } => "ProofComplete",
+                WsEvent::AggregationStart => "AggregationStart",
+                WsEvent::AggregationComplete { .. } => "AggregationComplete",
+                WsEvent::Groth16Wrapping { .. } => "Groth16Wrapping",
+                _ => "Other",
+            })
+            .collect();
+
+        // Helper: position of first occurrence of a tag.
+        let pos = |tag: &str| -> usize {
+            tags.iter()
+                .position(|t| *t == tag)
+                .unwrap_or_else(|| panic!("missing event tag {} in {:?}", tag, tags))
+        };
+
+        // Phase ordering: solver → proofs (start) → aggregation → wrap.
+        assert!(pos("SolverRunning") < pos("SolverComplete"));
+        assert!(pos("SolverComplete") < pos("AggregationStart"));
+        assert!(pos("AggregationStart") < pos("AggregationComplete"));
+        assert!(pos("AggregationComplete") < pos("Groth16Wrapping"));
+
+        // Each of the three base proofs emits exactly one ProofComplete.
+        let n_proof_complete = tags.iter().filter(|t| **t == "ProofComplete").count();
+        assert_eq!(
+            n_proof_complete, 3,
+            "expected 3 ProofComplete events (solver/execution/shapley), got {}",
+            n_proof_complete
+        );
+
+        // Groth16 wrap fires synthetic 25/50/75/100 progress.
+        let n_groth = tags.iter().filter(|t| **t == "Groth16Wrapping").count();
+        assert_eq!(
+            n_groth, 4,
+            "expected 4 Groth16Wrapping events, got {}",
+            n_groth
+        );
+
+        // Aggregated proof: mock_prove yields a 128-byte stub; public
+        // values are the ABI-encoded (uint256 epoch, uint16[] payouts)
+        // = 3 header words + n_intents element words = (3+n)*32 bytes.
+        assert_eq!(agg.proof_bytes.len(), 128);
+        assert_eq!(agg.public_values.len(), (3 + n_intents) * 32);
+        assert_eq!(agg.shapley_weights.len(), n_intents);
+
+        // Shapley weights must sum to exactly 10_000 bps (efficiency
+        // axiom). This catches drift between the off-chain solver's
+        // monte_carlo_shapley and the publicValues encoder.
+        let sum: u32 = agg.shapley_weights.iter().map(|(_, w)| *w as u32).sum();
+        assert_eq!(sum, 10_000, "shapley sum = {} != 10000", sum);
     }
 
     #[test]

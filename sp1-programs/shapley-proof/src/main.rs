@@ -2,17 +2,25 @@
 // Verification key must be extracted after compilation: `cargo prove build`
 // inside this directory.
 //
-// Purpose: proves that `cooperative_mev_value` was split by Monte Carlo
-// Shapley over the agents' priorities, then verifies the efficiency,
-// non-negativity, and symmetry axioms.
+// Purpose: proves that `cooperative_mev_value` was split by a deterministic
+// priority-weighted distribution over the agents' priorities, then verifies
+// the efficiency, non-negativity, and symmetry axioms.
+//
+// Naming note (H11 in Audit report): this used to be framed as "Monte Carlo
+// Shapley" but the marginal-contribution formula collapses to closed-form
+// proportional weighting because v(S) = sum-of-priorities is additive — the
+// permutation shuffle is mathematically a no-op. The 1,000-sample loop is
+// retained for SP1↔solver byte-parity (both sides do the same shuffle work)
+// but the framing has been corrected to `priority_weighted_split`. If a
+// future v(S) becomes non-additive (e.g. cooperative MEV that's actually
+// sub-additive in coalition size), revisit the algorithm in lockstep on
+// both sides.
 //
 // Algorithm:
 //   LCG seed advance: next = state * 6364136223846793005 + 1442695040888963407
 //   For `num_samples` iterations:
 //     - Fisher-Yates shuffle the agent index vector.
-//     - For each agent in shuffled order, marginal = priority_sum_with -
-//       priority_sum_without.
-//     - Accumulate.
+//     - Accumulate priority[i] for each agent.
 //   Average, renormalize so sum == cooperative_mev_value (efficiency).
 
 #![no_main]
@@ -160,8 +168,10 @@ fn hash_distribution(payouts: &[(AgentId, u128)]) -> [u8; 32] {
 }
 
 pub fn main() {
+    // M3: removed unused `_mev_value_in: u128` stdin read. Was previously
+    // consumed and discarded — wasted RV cycles, obscured intent. The
+    // cooperative_mev_value is sourced from `plan.cooperative_mev_value`.
     let plan: ExecutionPlan = sp1_zkvm::io::read();
-    let _mev_value_in: u128 = sp1_zkvm::io::read();
     let random_seed: u64 = sp1_zkvm::io::read();
     let num_samples: u32 = sp1_zkvm::io::read();
 
@@ -190,11 +200,12 @@ pub fn main() {
         fisher_yates_shuffle(&mut indices, &mut rng_state);
 
         // Walk the permutation accumulating priority_sum. Each agent's
-        // marginal contribution at their position is their own priority.
-        // This reduces to `priority[i]` averaged across permutations — which
-        // for a pure-priority valuation is identical to priority shares. We
-        // still perform the Monte Carlo loop so the algorithm generalizes
-        // when the valuation function is non-additive.
+        // marginal contribution at their position is their own priority —
+        // this reduces to `priority[i]` averaged across permutations,
+        // which for the current additive v(S) is identical to a closed-form
+        // priority-proportional split. We retain the shuffle loop for SP1
+        // ↔ solver byte-parity and as scaffolding for a future non-additive
+        // v(S) (see H11 in Audit report).
         let mut running: u128 = 0;
         for &idx in &indices {
             let before = running;

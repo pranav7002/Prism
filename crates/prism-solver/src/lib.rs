@@ -45,6 +45,11 @@ pub enum ConflictType {
     /// A lower-priority intent would execute before a higher-priority one
     /// (only raised by external callers; the resolver removes it by design).
     PriorityInversion,
+    /// A SetDynamicFee intent races an in-flight Swap on the same pool. The
+    /// swap settles at one fee while the curator changes the fee mid-epoch
+    /// — last-write semantics on the fee leave the swap's effective price
+    /// dependent on intent ordering inside the epoch (M2 in Audit report).
+    FeeSwapRace,
 }
 
 pub struct ConflictDetector;
@@ -111,6 +116,21 @@ fn pair_conflict(a: &AgentIntent, b: &AgentIntent) -> Option<ConflictType> {
             Action::SetDynamicFee { pool: ap, .. },
             Action::SetDynamicFee { pool: bp, .. },
         ) if ap == bp => Some(ConflictType::LiquidityRace),
+        // SetDynamicFee racing a Swap on the same pool — the swap's
+        // effective price depends on whether the fee bump executed first
+        // (closes M2). Both directions covered. Note: Backrun is a
+        // distinct Action variant (target_tx + profit_token, not Swap),
+        // so β's SetDynamicFee in epoch 2 doesn't conflict with δ's
+        // Backrun — preserves the β-migrate / δ-backrun cooperation
+        // documented in v2 §10.2.
+        (
+            Action::SetDynamicFee { pool: ap, .. },
+            Action::Swap { pool: bp, .. },
+        )
+        | (
+            Action::Swap { pool: bp, .. },
+            Action::SetDynamicFee { pool: ap, .. },
+        ) if ap == bp => Some(ConflictType::FeeSwapRace),
         _ => None,
     }
 }
@@ -334,7 +354,7 @@ pub fn build_execution_plan(
 
     let mev = CooperativeMevCalculator::new().calculate_mev_value(&placeholder_plan, protocol_state);
 
-    let weights = monte_carlo_shapley(&placeholder_plan.ordered_intents, epoch);
+    let weights = priority_weighted_split(&placeholder_plan.ordered_intents, epoch);
 
     Ok(ExecutionPlan {
         epoch,
@@ -345,27 +365,35 @@ pub fn build_execution_plan(
 }
 
 // ---------------------------------------------------------------------------
-// Monte Carlo Shapley value computation
+// Priority-weighted split (was: "Monte Carlo Shapley")
 // ---------------------------------------------------------------------------
 //
-// Port of the algorithm from `sp1-programs/shapley-proof/src/main.rs`.
-// Uses an LCG PRNG + Fisher-Yates shuffle to estimate each agent's
-// marginal contribution across random coalition orderings.
+// Port of the algorithm from `sp1-programs/shapley-proof/src/main.rs`. Uses
+// an LCG PRNG + Fisher-Yates shuffle to walk N permutations of the agent
+// index vector and accumulate per-agent contribution.
 //
-// The valuation function v(S) = sum of priorities of agents in S.
-// For additive valuations, Shapley values converge to priority-proportional
-// shares, but we keep the Monte Carlo loop so the algorithm generalizes
-// when the valuation function becomes non-additive (e.g., cooperative MEV
-// synergies between β and δ).
+// Naming honesty (H11 in Audit report): the prior name "Monte Carlo
+// Shapley" was misleading because v(S) = sum-of-priorities is additive, so
+// the marginal contribution at any position is exactly the agent's own
+// priority regardless of permutation. The 1,000-sample Fisher-Yates loop
+// therefore collapses mathematically to a closed-form proportional split
+// — a true Shapley value over a non-additive v(S) (e.g., sub-additive
+// cooperative MEV) would NOT collapse this way and would require a
+// different algorithm in lockstep on both sides.
+//
+// We retain the shuffle loop because (a) it's cheap, (b) byte-parity with
+// the SP1 circuit is preserved, and (c) it's the right shape for a future
+// non-additive v(S) — flip the marginal-contribution rule, keep the
+// scaffolding. But the framing is now correct.
 
 /// LCG multiplier — same constant used in the SP1 zkVM circuit.
 const LCG_MUL: u64 = 6_364_136_223_846_793_005;
 /// LCG increment — same constant used in the SP1 zkVM circuit.
 const LCG_INC: u64 = 1_442_695_040_888_963_407;
-/// Number of Monte Carlo permutation samples. 1000 gives <1% error for
-/// 5 agents. The SP1 circuit uses the same value (the orchestrator passes
-/// it as stdin to `shapley-proof` — it MUST read this constant, not its
-/// own literal, or proven and paid Shapley vectors diverge).
+/// Number of permutation samples. 1,000 gives <1% error for 5 agents on
+/// a non-additive v(S); for the current additive v(S) the value is
+/// numerically irrelevant but the SP1 circuit reads this same constant
+/// from stdin so they must stay in sync.
 pub const SHAPLEY_NUM_SAMPLES: u32 = 1_000;
 
 fn lcg_next(state: &mut u64) -> u64 {
@@ -385,12 +413,14 @@ fn fisher_yates_shuffle(arr: &mut [usize], state: &mut u64) {
     }
 }
 
-/// Compute Shapley values via Monte Carlo sampling and return basis-point
-/// weights summing to exactly 10,000.
+/// Compute deterministic priority-weighted basis-point weights summing to
+/// exactly 10,000. Pre-H11 fix this was `monte_carlo_shapley`; renamed
+/// because for the current additive v(S) the algorithm is provably
+/// equivalent to a closed-form proportional split.
 ///
 /// `seed` is derived from the epoch to ensure deterministic results across
 /// runs. The same seed + intents always produce the same weights.
-fn monte_carlo_shapley(intents: &[AgentIntent], seed: u64) -> Vec<(AgentId, u16)> {
+fn priority_weighted_split(intents: &[AgentIntent], seed: u64) -> Vec<(AgentId, u16)> {
     let n = intents.len();
     if n == 0 {
         return vec![];
@@ -718,8 +748,69 @@ mod tests {
         assert!(matches!(err, SolverError::UnresolvableConflict(_)));
     }
 
+    #[test]
+    fn set_dynamic_fee_racing_swap_on_same_pool_conflicts() {
+        // M2 fix: a SetDynamicFee and a Swap on the same pool race.
+        let fee = Action::SetDynamicFee {
+            pool: [0xDD; 20], // matches swap()'s pool
+            new_fee_ppm: 6_000,
+        };
+        // Order 1: fee then swap.
+        let intents = vec![
+            intent(0x01, 65, fee.clone(), 9),
+            intent(0x02, 80, swap(1_000), 9),
+        ];
+        let conflicts = ConflictDetector::new().detect(&intents);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].2, ConflictType::FeeSwapRace);
+
+        // Order 2: swap then fee — same conflict, different ordering.
+        let intents = vec![
+            intent(0x01, 80, swap(1_000), 9),
+            intent(0x02, 65, fee, 9),
+        ];
+        let conflicts = ConflictDetector::new().detect(&intents);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].2, ConflictType::FeeSwapRace);
+    }
+
+    #[test]
+    fn set_dynamic_fee_on_different_pool_does_not_conflict_with_swap() {
+        // SetDynamicFee on pool A while Swap targets pool B — no race.
+        let fee = Action::SetDynamicFee {
+            pool: [0xAA; 20],
+            new_fee_ppm: 6_000,
+        };
+        // swap() above hits pool [0xDD; 20] — different from [0xAA; 20].
+        let intents = vec![intent(0x01, 65, fee, 9), intent(0x02, 80, swap(1), 9)];
+        let conflicts = ConflictDetector::new().detect(&intents);
+        assert!(
+            conflicts.is_empty(),
+            "different pools must not race: {:?}",
+            conflicts
+        );
+    }
+
+    #[test]
+    fn set_dynamic_fee_does_not_conflict_with_backrun() {
+        // Regression guard for v2 §10.2: β's SetDynamicFee and δ's Backrun
+        // must coexist in epoch 2 without flagging a conflict (Backrun is
+        // a distinct Action variant, not Swap). M2 fix preserves this.
+        let fee = Action::SetDynamicFee {
+            pool: [0xDD; 20],
+            new_fee_ppm: 6_000,
+        };
+        let intents = vec![intent(0x01, 75, fee, 2), intent(0x02, 90, backrun(), 2)];
+        let conflicts = ConflictDetector::new().detect(&intents);
+        assert!(
+            conflicts.is_empty(),
+            "β-fee + δ-backrun cooperation broke: {:?}",
+            conflicts
+        );
+    }
+
     // -----------------------------------------------------------------------
-    // Monte Carlo Shapley tests
+    // priority_weighted_split tests (H11 — was "Monte Carlo Shapley tests")
     // -----------------------------------------------------------------------
 
     #[test]
@@ -729,7 +820,7 @@ mod tests {
             intent(0x01, 90, swap(1_000), 1),
             intent(0x02, 10, swap(2_000), 1),
         ];
-        let weights = monte_carlo_shapley(&intents, 42);
+        let weights = priority_weighted_split(&intents, 42);
         assert_eq!(weights.len(), 2);
         let sum: u32 = weights.iter().map(|(_, w)| *w as u32).sum();
         assert_eq!(sum, 10_000, "efficiency axiom violated");
@@ -753,8 +844,8 @@ mod tests {
             intent(0x02, 50, swap(2_000), 1),
             intent(0x03, 30, swap(3_000), 1),
         ];
-        let w1 = monte_carlo_shapley(&intents, 99);
-        let w2 = monte_carlo_shapley(&intents, 99);
+        let w1 = priority_weighted_split(&intents, 99);
+        let w2 = priority_weighted_split(&intents, 99);
         assert_eq!(w1, w2, "same seed must produce identical weights");
     }
 
@@ -765,7 +856,7 @@ mod tests {
             intent(0x02, 50, swap(2_000), 1),
             intent(0x03, 50, swap(3_000), 1),
         ];
-        let weights = monte_carlo_shapley(&intents, 7);
+        let weights = priority_weighted_split(&intents, 7);
         let sum: u32 = weights.iter().map(|(_, w)| *w as u32).sum();
         assert_eq!(sum, 10_000);
         // Each agent should get ~3333 bps. Allow rounding dust.
@@ -781,7 +872,7 @@ mod tests {
     #[test]
     fn shapley_single_agent_gets_all() {
         let intents = vec![intent(0x01, 50, swap(1_000), 1)];
-        let weights = monte_carlo_shapley(&intents, 1);
+        let weights = priority_weighted_split(&intents, 1);
         assert_eq!(weights.len(), 1);
         assert_eq!(weights[0].1, 10_000);
     }

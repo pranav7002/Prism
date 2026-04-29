@@ -7,6 +7,13 @@
 //! The real `UniswapClient::get_pool_state` is wired into the orchestrator's
 //! epoch loop; `MockUniswapClient` is retained as cold-start / hard-failure
 //! fallback for local dev without network access.
+//!
+//! Unused-API allowance: `SwapQuote`, `LpPosition`, `get_swap_quote`,
+//! `get_lp_positions`, and the response wire structs are public surface
+//! for future agents that need quote / position data. They're not yet
+//! consumed by the epoch loop, so rustc flags them as dead. Keep the
+//! API present so Dev 3 can wire them without round-tripping through me.
+#![allow(dead_code)]
 
 use anyhow::Context;
 use prism_types::ProtocolState;
