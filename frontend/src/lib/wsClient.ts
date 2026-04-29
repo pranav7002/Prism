@@ -78,6 +78,7 @@ export function useWsEvents(
         if (!mountedRef.current) return;
         try {
           const parsed = JSON.parse(evt.data as string) as WsEvent;
+          if (!parsed || !parsed.type) return; // Drop malformed payloads to prevent selector crashes
           setEvents((prev) => [parsed, ...prev].slice(0, MAX_EVENTS));
         } catch {
           // Ignore malformed messages

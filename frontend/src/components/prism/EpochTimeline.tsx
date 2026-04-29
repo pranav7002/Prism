@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { motion } from "framer-motion";
 import { useDemoMode } from "@/store/demoMode";
 import { useWsEvents } from "@/lib/wsClient";
-import { currentEpoch } from "@/lib/derivedState";
+import { currentEpoch, currentPhaseIdx } from "@/lib/derivedState";
 
 const phases = ["Commit", "Reveal", "Solve", "Prove", "Settle"] as const;
 type Phase = typeof phases[number];
@@ -12,9 +12,10 @@ const phaseDuration = 8; // seconds each
 const EpochTimeline = () => {
   const { demo, wsUrl, demoPhaseIdx } = useDemoMode();
   const { events } = useWsEvents(wsUrl, !demo);
-  const liveEpoch = !demo ? currentEpoch(events) : null;
+  const liveEpoch = useMemo(() => (!demo ? currentEpoch(events) : null), [demo, events]);
+  const livePhase = useMemo(() => (!demo ? currentPhaseIdx(events) : null), [demo, events]);
 
-  const activeIdx = demo ? demoPhaseIdx : 2; // fallback for live without events
+  const activeIdx = demo ? demoPhaseIdx : (livePhase ?? 0);
   const [countdown, setCountdown] = useState(phaseDuration);
 
   useEffect(() => {

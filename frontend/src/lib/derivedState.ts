@@ -56,6 +56,21 @@ export function currentEpoch(events: WsEvent[]): number | null {
   return null;
 }
 
+/** 
+ * Dynamically derives the timeline phase index (0 to 4) based on the latest WS events.
+ * 0: Commit, 1: Reveal, 2: Solve, 3: Prove, 4: Settle
+ */
+export function currentPhaseIdx(events: WsEvent[]): number {
+  for (const e of events) {
+    if (e.type === "epoch_settled" || e.type === "epoch_settled_via_plan_b") return 4;
+    if (e.type === "proof_progress" || e.type === "aggregation_start" || e.type === "groth16_wrapping") return 3;
+    if (e.type === "solver_running" || e.type === "solver_complete") return 2;
+    if (e.type === "intents_received") return 1;
+    if (e.type === "epoch_start") return 0;
+  }
+  return 0; // Fallback to Commit if no events exist yet
+}
+
 /** Title-case a snake/lower program label so existing UI keys ("Solver",
  *  "Execution", "Shapley", "Aggregator") keep matching even though the wire
  *  format is lowercase. */

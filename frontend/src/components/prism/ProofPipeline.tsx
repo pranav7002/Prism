@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useDemoMode } from "@/store/demoMode";
 import { useWsEvents } from "@/lib/wsClient";
@@ -22,7 +22,7 @@ const ProofPipeline = () => {
   const { events } = useWsEvents(wsUrl, !demo);
 
   // Live-derived progress (only used when !demo)
-  const liveProgress = !demo ? proofProgress(events) : null;
+  const liveProgress = useMemo(() => (!demo ? proofProgress(events) : null), [demo, events]);
   const hasLiveData = liveProgress !== null && Object.keys(liveProgress).length > 0;
 
   const [phase, setPhase] = useState<Phase>("generating");
@@ -72,6 +72,26 @@ const ProofPipeline = () => {
       clearTimeout(raf);
     };
   }, [demo, demoPhaseIdx]);
+
+  // Live Mode phase tracking
+  useEffect(() => {
+    if (demo || events.length === 0) return;
+    
+    // Find highest stage in recent events
+    let newPhase: Phase = "generating";
+    for (const e of events) {
+      if (e.type === "epoch_settled" || e.type === "epoch_settled_via_plan_b") {
+        newPhase = "verified"; break;
+      } else if (e.type === "groth16_wrapping") {
+        newPhase = "wrapping"; break;
+      } else if (e.type === "aggregation_start" || e.type === "aggregation_complete") {
+        newPhase = "merging"; break;
+      } else if (e.type === "epoch_start") {
+        break; // Stop looking backwards if we hit the start of this epoch
+      }
+    }
+    setPhase(newPhase);
+  }, [demo, events]);
 
   // Determine which progress values to display
   const progress = hasLiveData ? liveProgress! : demoProgress;

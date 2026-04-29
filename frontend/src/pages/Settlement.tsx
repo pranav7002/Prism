@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useDemoMode } from "@/store/demoMode";
 import { useWsEvents } from "@/lib/wsClient";
@@ -166,7 +166,7 @@ const Settlement = () => {
   const { demo, wsUrl, demoHistory } = useDemoMode();
   const { events } = useWsEvents(wsUrl, !demo);
   
-  const liveHistory = !demo ? epochHistory(events) : [];
+  const liveHistory = useMemo(() => (!demo ? epochHistory(events) : []), [demo, events]);
   // Merge live and demo history depending on mode
   const history = demo ? demoHistory : liveHistory;
 
