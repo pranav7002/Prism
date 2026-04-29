@@ -3,13 +3,14 @@ import { motion, AnimatePresence } from "framer-motion";
 import { useDemoMode } from "@/store/demoMode";
 import { useWsEvents } from "@/lib/wsClient";
 import { proofProgress } from "@/lib/derivedState";
+import { Cpu, Database, Network } from "lucide-react";
 
-type Track = { key: string; label: string; color: string };
+type Track = { key: string; label: string; color: string; cycles: string };
 // Track keys match WsEvent ProofProgress program names (PascalCase)
 const tracks: Track[] = [
-  { key: "Solver", label: "Solver", color: "hsl(var(--agent-alpha))" },
-  { key: "Execution", label: "Execution", color: "hsl(var(--agent-beta))" },
-  { key: "Shapley", label: "Shapley", color: "hsl(var(--agent-delta))" },
+  { key: "Solver", label: "Solver Matrix", color: "hsl(var(--agent-alpha))", cycles: "12,459,102" },
+  { key: "Execution", label: "Pool Execution", color: "hsl(var(--agent-beta))", cycles: "4,192,840" },
+  { key: "Shapley", label: "Shapley Vector", color: "hsl(var(--agent-delta))", cycles: "8,921,411" },
 ];
 
 type Phase = "generating" | "merging" | "wrapping" | "verified";
@@ -83,8 +84,8 @@ const ProofPipeline = () => {
     <div className="glass p-8 md:p-10" style={{ minHeight: 460 }}>
       <div className="mb-8 flex items-end justify-between">
         <div>
-          <p className="mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">Cryptographic · Pipeline</p>
-          <h2 className="display text-2xl md:text-3xl mt-2">Proof Generation</h2>
+          <p className="mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">SP1 zkVM</p>
+          <h2 className="display text-2xl md:text-3xl mt-2">Recursive Aggregation Tree</h2>
         </div>
         <p className="mono text-[11px] uppercase tracking-[0.12em] text-muted-foreground capitalize">
           {phase}
@@ -105,12 +106,22 @@ const ProofPipeline = () => {
                 className="py-1"
               >
                 <div className="flex items-center justify-between mb-1.5">
-                  <span className="mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-                    {t.label}
+                  <span className="mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground flex items-center gap-2">
+                    <Cpu className="w-3 h-3" /> {t.label}
                   </span>
-                  <span className="mono text-[10px] tabular" style={{ color: t.color }}>
-                    {pct}%
-                  </span>
+                  <div className="flex items-center gap-3">
+                    {pct === 100 && (
+                      <motion.span 
+                        initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                        className="mono text-[9px] text-muted-foreground hidden sm:block bg-black/30 px-2 py-0.5 rounded border border-white/5"
+                      >
+                        {t.cycles} cycles
+                      </motion.span>
+                    )}
+                    <span className="mono text-[10px] tabular" style={{ color: t.color }}>
+                      {pct}%
+                    </span>
+                  </div>
                 </div>
                 <div
                   className="relative h-3 rounded-full overflow-hidden"
@@ -170,24 +181,47 @@ const ProofPipeline = () => {
         </div>
 
         {/* Aggregator + Groth16 */}
-        <div className="col-span-12 md:col-span-5 space-y-4">
+        <div className="col-span-12 md:col-span-5 space-y-4 flex flex-col justify-center">
           <motion.div
             animate={{
               scale: phase === "merging" ? 1.05 : 1,
               boxShadow:
                 phase === "merging" || phase === "wrapping"
-                  ? "0 0 60px hsl(var(--primary) / 0.6)"
+                  ? "0 0 60px hsl(var(--primary) / 0.3)"
                   : "0 0 0 transparent",
             }}
             transition={{ duration: 0.5 }}
-            className="rounded-2xl p-5"
+            className="rounded-xl p-5"
             style={{
               background: "hsl(var(--surface-2) / 0.6)",
               border: "1px solid hsl(var(--primary) / 0.4)",
             }}
           >
-            <p className="mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Aggregator</p>
-            <p className="display text-xl mt-1">Compressing 3 → 1</p>
+            <div className="flex items-start justify-between">
+              <div>
+                 <p className="mono text-[10px] uppercase tracking-[0.14em] text-[hsl(var(--primary))] flex items-center gap-2 mb-1">
+                   <Network className="w-3 h-3" /> Recursive SNARK
+                 </p>
+                 <p className="display text-xl">Aggregating Proofs</p>
+              </div>
+              <div className="text-right">
+                <span className="mono text-[10px] text-muted-foreground block mb-1">Compression</span>
+                <span className="mono text-sm text-[hsl(var(--primary))]">3 STARKs → 1</span>
+              </div>
+            </div>
+            
+            {(phase === "merging" || phase === "wrapping" || phase === "verified") && (
+               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="mt-4 pt-4 border-t border-[hsl(var(--primary))/0.2] grid grid-cols-2 gap-4">
+                 <div>
+                   <p className="mono text-[9px] uppercase text-muted-foreground">Tree Height</p>
+                   <p className="mono text-xs">Level 2 Aggregation</p>
+                 </div>
+                 <div>
+                   <p className="mono text-[9px] uppercase text-muted-foreground">Core System</p>
+                   <p className="mono text-xs">SP1 RISC-V</p>
+                 </div>
+               </motion.div>
+            )}
           </motion.div>
 
           <motion.div
@@ -195,34 +229,31 @@ const ProofPipeline = () => {
               x: phase === "wrapping" ? [0, -2, 2, -2, 2, 0] : 0,
             }}
             transition={{ duration: 0.5 }}
-            className="rounded-2xl p-5 relative overflow-hidden"
+            className="rounded-xl p-5 relative overflow-hidden"
             style={{
               background: "hsl(var(--surface-1) / 0.6)",
               border: `1px solid ${phase === "verified" ? "hsl(var(--agent-beta) / 0.7)" : "hsl(var(--foreground) / 0.08)"}`,
-              boxShadow: phase === "verified" ? "0 0 40px hsl(var(--agent-beta) / 0.4)" : "none",
+              boxShadow: phase === "verified" ? "0 0 40px hsl(var(--agent-beta) / 0.2)" : "none",
             }}
           >
             <div className="flex items-center justify-between">
               <div>
-                <p className="mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Groth16</p>
-                <p className="display text-xl mt-1">On-Chain Settlement</p>
+                <p className="mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground flex items-center gap-2 mb-1">
+                  <Database className="w-3 h-3" /> Groth16 Wrapper
+                </p>
+                <p className="display text-xl">On-Chain Verifier</p>
               </div>
               <AnimatePresence>
                 {phase === "verified" && (
-                  <motion.span
+                  <motion.div
                     initial={{ scale: 0, opacity: 0 }}
                     animate={{ scale: 1, opacity: 1 }}
                     exit={{ opacity: 0 }}
                     transition={{ type: "spring", stiffness: 200, damping: 14 }}
-                    className="mono text-[10px] uppercase tracking-[0.14em] px-3 py-1.5 rounded-full"
-                    style={{
-                      color: "hsl(var(--agent-beta))",
-                      background: "hsl(var(--agent-beta) / 0.12)",
-                      border: "1px solid hsl(var(--agent-beta) / 0.5)",
-                    }}
                   >
-                    ✓ Verified
-                  </motion.span>
+                    <span className="mono text-sm font-bold block mb-1 text-right text-[hsl(var(--agent-beta))]">260 Bytes</span>
+                    <span className="mono text-[9px] tracking-[0.1em] text-muted-foreground block text-right uppercase">✓ Settled</span>
+                  </motion.div>
                 )}
               </AnimatePresence>
             </div>
