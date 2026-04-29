@@ -70,16 +70,12 @@ contract DeployPrismHook is Script {
         console.log("MockAave:       ", address(aave));
 
         uint160 flags = uint160(
-            (1 << 13) | // BEFORE_INITIALIZE
-            (1 << 12) | // AFTER_INITIALIZE
             (1 << 11) | // BEFORE_ADD_LIQUIDITY
             (1 << 10) | // AFTER_ADD_LIQUIDITY
-            (1 << 9) |  // BEFORE_REMOVE_LIQUIDITY
-            (1 << 8) |  // AFTER_REMOVE_LIQUIDITY
-            (1 << 7) |  // BEFORE_SWAP
-            (1 << 6) |  // AFTER_SWAP
-            (1 << 5) |  // BEFORE_DONATE
-            (1 << 4)    // AFTER_DONATE
+            (1 << 9)  | // BEFORE_REMOVE_LIQUIDITY
+            (1 << 8)  | // AFTER_REMOVE_LIQUIDITY
+            (1 << 7)  | // BEFORE_SWAP
+            (1 << 6)    // AFTER_SWAP
         );
 
         address CREATE2_FACTORY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;

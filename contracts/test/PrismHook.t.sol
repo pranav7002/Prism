@@ -6,6 +6,7 @@ import {PrismHook} from "../src/PrismHook.sol";
 import {MockSP1Verifier} from "../src/MockSP1Verifier.sol";
 import {MockAave} from "../src/MockAave.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 
 /// @title PrismHook Test Suite
 /// @notice Unit + fuzz tests for PrismHook, MockAave, and MockSP1Verifier.
@@ -27,16 +28,19 @@ contract PrismHookTest is Test {
     address constant POOL_MANAGER = address(1);
 
     bytes32 constant MOCK_VKEY = bytes32(uint256(0xCAFE));
+    bytes32 constant MOCK_SOLVER_VKEY = bytes32(uint256(0xA01));
+    bytes32 constant MOCK_EXEC_VKEY = bytes32(uint256(0xA02));
+    bytes32 constant MOCK_SHAPLEY_VKEY = bytes32(uint256(0xA03));
+
+    /// Helper: prepend the SCHEMA_VERSION byte to abi-encoded inner pv.
+    function _withSchema(bytes memory inner) internal pure returns (bytes memory) {
+        return bytes.concat(hex"01", inner);
+    }
 
     function setUp() public {
         verifier = new MockSP1Verifier();
         aave = new MockAave();
-        hook = new PrismHook(
-            IPoolManager(POOL_MANAGER),
-            verifier,
-            MOCK_VKEY,
-            address(this)
-        );
+        hook = new PrismHook(IPoolManager(POOL_MANAGER), verifier, MOCK_VKEY, address(this));
 
         // Register 5 agents with appropriate capabilities.
         hook.registerAgent(
@@ -198,7 +202,7 @@ contract PrismHookTest is Test {
         payouts[3] = 1500; // δ
         payouts[4] = 0; // ε
 
-        bytes memory publicValues = abi.encode(uint256(1), payouts);
+        bytes memory publicValues = _withSchema(abi.encode(uint256(1), payouts));
         bytes memory proof = hex"CAFE";
 
         hook.settleEpoch(proof, publicValues);
@@ -216,7 +220,7 @@ contract PrismHookTest is Test {
         uint16[] memory payouts = new uint16[](5);
         payouts[0] = 10000;
         // epoch 99 doesn't match currentEpoch (1)
-        bytes memory publicValues = abi.encode(uint256(99), payouts);
+        bytes memory publicValues = _withSchema(abi.encode(uint256(99), payouts));
         bytes memory proof = hex"CAFE";
 
         vm.expectRevert(PrismHook.EpochMismatch.selector);
@@ -228,7 +232,7 @@ contract PrismHookTest is Test {
         payouts[0] = 5000;
         payouts[1] = 4999; // sum = 9999, not 10000
 
-        bytes memory publicValues = abi.encode(uint256(1), payouts);
+        bytes memory publicValues = _withSchema(abi.encode(uint256(1), payouts));
         bytes memory proof = hex"CAFE";
 
         vm.expectRevert(PrismHook.PayoutSumMismatch.selector);
@@ -243,7 +247,7 @@ contract PrismHookTest is Test {
         // Settle clears kill-switch.
         uint16[] memory payouts = new uint16[](5);
         payouts[0] = 10000;
-        bytes memory publicValues = abi.encode(uint256(1), payouts);
+        bytes memory publicValues = _withSchema(abi.encode(uint256(1), payouts));
         hook.settleEpoch(hex"CAFE", publicValues);
 
         assertFalse(hook.killSwitchActive());
@@ -273,7 +277,7 @@ contract PrismHookTest is Test {
         payouts[3] = d;
         payouts[4] = e;
 
-        bytes memory publicValues = abi.encode(uint256(1), payouts);
+        bytes memory publicValues = _withSchema(abi.encode(uint256(1), payouts));
         hook.settleEpoch(hex"CAFE", publicValues);
 
         assertEq(hook.currentEpoch(), 2);
@@ -332,7 +336,7 @@ contract PrismHookTest is Test {
         payouts[3] = 1500;
         payouts[4] = 1000;
 
-        bytes memory publicValues = abi.encode(uint256(1), payouts);
+        bytes memory publicValues = _withSchema(abi.encode(uint256(1), payouts));
         hook.settleEpoch(hex"CAFE", publicValues);
 
         // 4. Verify state advanced.
@@ -341,5 +345,230 @@ contract PrismHookTest is Test {
         uint16[] memory stored = hook.getPayouts(1);
         assertEq(stored[0], 3500);
         assertEq(stored[4], 1000);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  H17: Operator gating on settleEpoch
+    // ═══════════════════════════════════════════════════════════════
+
+    function test_settleEpoch_reverts_when_not_operator() public {
+        address rando = address(0xBEEF);
+        uint16[] memory payouts = new uint16[](5);
+        payouts[0] = 10000;
+        bytes memory publicValues = _withSchema(abi.encode(uint256(1), payouts));
+
+        vm.prank(rando);
+        vm.expectRevert(PrismHook.NotOperator.selector);
+        hook.settleEpoch(hex"CAFE", publicValues);
+    }
+
+    function test_addOperator_owner_only() public {
+        address rando = address(0xBEEF);
+        vm.prank(rando);
+        vm.expectRevert(PrismHook.NotAuthorized.selector);
+        hook.addOperator(rando);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  M6: Payout/agent invariant
+    // ═══════════════════════════════════════════════════════════════
+
+    function test_settleEpoch_reverts_when_payouts_length_mismatch() public {
+        // 5 agents registered, but only 1 payout element — must revert.
+        uint16[] memory payouts = new uint16[](1);
+        payouts[0] = 10000;
+        bytes memory publicValues = _withSchema(abi.encode(uint256(1), payouts));
+
+        vm.expectRevert(PrismHook.PayoutAgentMismatch.selector);
+        hook.settleEpoch(hex"CAFE", publicValues);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Hook permissions: exactly 6 flags active
+    // ═══════════════════════════════════════════════════════════════
+
+    function test_getHookPermissions_returns_six_flags() public view {
+        Hooks.Permissions memory p = hook.getHookPermissions();
+
+        // The 6 active flags.
+        assertTrue(p.beforeAddLiquidity);
+        assertTrue(p.afterAddLiquidity);
+        assertTrue(p.beforeRemoveLiquidity);
+        assertTrue(p.afterRemoveLiquidity);
+        assertTrue(p.beforeSwap);
+        assertTrue(p.afterSwap);
+
+        // All others must be false.
+        assertFalse(p.beforeInitialize);
+        assertFalse(p.afterInitialize);
+        assertFalse(p.beforeDonate);
+        assertFalse(p.afterDonate);
+        assertFalse(p.beforeSwapReturnDelta);
+        assertFalse(p.afterSwapReturnDelta);
+        assertFalse(p.afterAddLiquidityReturnDelta);
+        assertFalse(p.afterRemoveLiquidityReturnDelta);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Schema-version unwrap (transport layer)
+    // ═══════════════════════════════════════════════════════════════
+
+    function test_settleEpoch_rejects_unknown_schema_version() public {
+        uint16[] memory payouts = new uint16[](5);
+        payouts[0] = 10000;
+        // 0x99 != SCHEMA_VERSION (1)
+        bytes memory publicValues = bytes.concat(hex"99", abi.encode(uint256(1), payouts));
+
+        vm.expectRevert(PrismHook.SchemaVersionUnsupported.selector);
+        hook.settleEpoch(hex"CAFE", publicValues);
+    }
+
+    function test_settleEpoch_rejects_empty_public_values() public {
+        bytes memory publicValues = "";
+        vm.expectRevert(PrismHook.EmptyPublicValues.selector);
+        hook.settleEpoch(hex"CAFE", publicValues);
+    }
+
+    function test_schema_version_constant_is_one() public view {
+        assertEq(hook.SCHEMA_VERSION(), 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Plan-B: settleEpochThreeProof
+    // ═══════════════════════════════════════════════════════════════
+
+    function _planBPv() internal pure returns (bytes memory) {
+        // Inner pv shape doesn't matter for MockSP1Verifier (it accepts all).
+        // Schema byte is mandatory.
+        return _withSchema(hex"DEAD");
+    }
+
+    function test_settleEpoch_three_proof_happy_path() public {
+        // Arrange: set sub-vkeys so the path is unlocked.
+        hook.setSubVkeys(MOCK_SOLVER_VKEY, MOCK_EXEC_VKEY, MOCK_SHAPLEY_VKEY);
+
+        uint16[] memory payouts = new uint16[](5);
+        payouts[0] = 4000;
+        payouts[1] = 2500;
+        payouts[2] = 2000;
+        payouts[3] = 1500;
+        payouts[4] = 0;
+
+        hook.settleEpochThreeProof(
+            hex"AA", _planBPv(),
+            hex"BB", _planBPv(),
+            hex"CC", _planBPv(),
+            uint256(1),
+            payouts
+        );
+
+        assertEq(hook.currentEpoch(), 2);
+        assertFalse(hook.killSwitchActive());
+        uint16[] memory stored = hook.getPayouts(1);
+        assertEq(stored[0], 4000);
+        assertEq(stored[4], 0);
+    }
+
+    function test_settleEpoch_three_proof_reverts_when_sub_vkeys_unset() public {
+        uint16[] memory payouts = new uint16[](5);
+        payouts[0] = 10000;
+
+        vm.expectRevert(PrismHook.SubVkeysNotSet.selector);
+        hook.settleEpochThreeProof(
+            hex"AA", _planBPv(),
+            hex"BB", _planBPv(),
+            hex"CC", _planBPv(),
+            uint256(1),
+            payouts
+        );
+    }
+
+    function test_settleEpoch_three_proof_revoked_agent_must_have_zero_payout() public {
+        hook.setSubVkeys(MOCK_SOLVER_VKEY, MOCK_EXEC_VKEY, MOCK_SHAPLEY_VKEY);
+        hook.revokeAgent(epsilon); // index 4 in agentList
+
+        uint16[] memory payouts = new uint16[](5);
+        payouts[0] = 4000;
+        payouts[1] = 2500;
+        payouts[2] = 2000;
+        payouts[3] = 500;
+        payouts[4] = 1000; // revoked but non-zero — must revert
+
+        vm.expectRevert(PrismHook.RevokedAgentMustHaveZeroPayout.selector);
+        hook.settleEpochThreeProof(
+            hex"AA", _planBPv(),
+            hex"BB", _planBPv(),
+            hex"CC", _planBPv(),
+            uint256(1),
+            payouts
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Sub-vkey administration
+    // ═══════════════════════════════════════════════════════════════
+
+    function test_setSubVkeys_owner_only_and_freezable() public {
+        address rando = address(0xBEEF);
+        vm.prank(rando);
+        vm.expectRevert(PrismHook.NotAuthorized.selector);
+        hook.setSubVkeys(MOCK_SOLVER_VKEY, MOCK_EXEC_VKEY, MOCK_SHAPLEY_VKEY);
+
+        // Owner can set.
+        hook.setSubVkeys(MOCK_SOLVER_VKEY, MOCK_EXEC_VKEY, MOCK_SHAPLEY_VKEY);
+        assertEq(hook.solverVkey(), MOCK_SOLVER_VKEY);
+        assertEq(hook.executionVkey(), MOCK_EXEC_VKEY);
+        assertEq(hook.shapleyVkey(), MOCK_SHAPLEY_VKEY);
+
+        // Freeze + reverify lock.
+        hook.freezeSubVkeys();
+        assertTrue(hook.subVkeysFrozen());
+        vm.expectRevert(PrismHook.SubVkeysFrozen.selector);
+        hook.setSubVkeys(MOCK_SOLVER_VKEY, MOCK_EXEC_VKEY, MOCK_SHAPLEY_VKEY);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Capability rotation
+    // ═══════════════════════════════════════════════════════════════
+
+    function test_revokeAgent_owner_only() public {
+        address rando = address(0xBEEF);
+        vm.prank(rando);
+        vm.expectRevert(PrismHook.NotAuthorized.selector);
+        hook.revokeAgent(alpha);
+
+        // Reverts on unregistered.
+        vm.expectRevert(PrismHook.AgentNotRegistered.selector);
+        hook.revokeAgent(address(0xDEAD));
+
+        // Owner happy path.
+        hook.revokeAgent(alpha);
+        assertTrue(hook.revoked(alpha));
+    }
+
+    function test_updateAgentCaps_owner_only() public {
+        PrismHook.AgentCapabilities memory newCaps = PrismHook.AgentCapabilities({
+            canLP: false,
+            canSwap: true,
+            canBackrun: false,
+            canHedge: false,
+            canSetFee: false,
+            canKillSwitch: false
+        });
+
+        address rando = address(0xBEEF);
+        vm.prank(rando);
+        vm.expectRevert(PrismHook.NotAuthorized.selector);
+        hook.updateAgentCaps(alpha, newCaps);
+
+        // Reverts on unregistered.
+        vm.expectRevert(PrismHook.AgentNotRegistered.selector);
+        hook.updateAgentCaps(address(0xDEAD), newCaps);
+
+        // Owner happy path.
+        hook.updateAgentCaps(alpha, newCaps);
+        (bool canLP, bool canSwap,,,,) = hook.agentCaps(alpha);
+        assertFalse(canLP);
+        assertTrue(canSwap);
     }
 }
