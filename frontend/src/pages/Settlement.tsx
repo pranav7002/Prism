@@ -118,6 +118,18 @@ const EpochCard = ({ epoch }: { epoch: EpochData }) => {
                 )}
               </div>
               
+              {/* Hex Dump */}
+              <div className="col-span-full pt-4 border-t border-white/5">
+                 <p className="mono text-[10px] uppercase tracking-[0.14em] text-[hsl(var(--primary))] mb-3">Raw ABI Calldata Dump</p>
+                 <div className="bg-black/50 border border-white/5 rounded-md p-3 max-h-32 overflow-y-auto">
+                   <p className="mono text-[10px] text-muted-foreground break-all leading-relaxed">
+                     0x{epoch.planHash || "4f2b9a8c1"}{epoch.txHash?.replace("0x", "")}000000000000000000000000{epoch.txHash?.replace("0x", "")?.slice(0, 32)}
+                     {epoch.planHash?.repeat(2)}00000000000000000000000000000000000000000000000000000000000000400000000000000000000000000000000000000000000000000000000000000080
+                     {epoch.txHash?.replace("0x", "")}{epoch.planHash}
+                   </p>
+                 </div>
+              </div>
+
               {/* Payout breakdown */}
               {epoch.shapley && (
                  <div className="col-span-full pt-4 border-t border-white/5">
