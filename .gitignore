@@ -1,0 +1,18 @@
+# Rust
+/target/
+target/
+**/target/
+*.rs.bk
+
+# SP1 build artifacts
+sp1-programs/**/elf/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

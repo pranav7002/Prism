@@ -1,0 +1,22 @@
+[package]
+name = "solver-proof"
+version = "0.1.0"
+edition = "2021"
+
+# NOTE: this program compiles to the `riscv32im-succinct-zkvm-elf` target via
+# `cargo prove build`, which requires the SP1 toolchain (install with `sp1up`).
+# Plain `cargo check` works on the host because sp1-zkvm is published on
+# crates.io as a regular library.
+
+[dependencies]
+sp1-zkvm = "3.0.0"
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+sha2 = { version = "0.10", default-features = false }
+tiny-keccak = { version = "2", features = ["keccak"] }
+
+[[bin]]
+name = "solver-proof"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3

@@ -1,0 +1,15 @@
+# Pinned toolchain for the host crates (prism-types, prism-solver,
+# prism-orchestrator). The SP1 zkVM programs use their own toolchain via
+# `cargo prove` and don't read this file.
+#
+# Why this exists: the orchestrator's behavior depends on bincode-serialized
+# stdin shapes that the SP1 sub-program ELFs were compiled against. Drift
+# between someone's local rustc and what the committed ELFs were built with
+# can produce subtle layout differences. Pinning here is a defense.
+#
+# When bumping rustc, also rebuild all four SP1 ELFs (`make rebuild-elfs`)
+# and update ELF_SHAS.txt + AGGREGATOR_VKEY.txt.
+
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

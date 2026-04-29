@@ -1,0 +1,59 @@
+[package]
+name = "prism-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Main PRISM runner: epoch loop, proving pipeline, WebSocket server."
+
+[features]
+# Default: substitute empty byte slices for SP1 ELFs so `cargo check` /
+# `cargo run` work on a fresh checkout before `cargo prove build` has been
+# run. Disable this feature to include real ELFs.
+default = ["mock-elf"]
+mock-elf = []
+# Pulls in the SP1 prover SDK. Enable alongside `--no-default-features` to
+# turn on real proving once ELFs have been produced by `cargo prove build`.
+real-prover = ["dep:sp1-sdk"]
+
+[dependencies]
+prism-types = { path = "../prism-types" }
+prism-solver = { path = "../prism-solver" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tiny-keccak = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+bincode = "1.3"
+# Solidity ABI encoding for `(uint256 epoch, uint16[] payouts)` —
+# replaces the prior hand-rolled encoder (M12). Pin the same version
+# already in the dep tree (sp1-sdk pulls it in at 0.7.7).
+alloy-sol-types = "0.7"
+alloy-primitives = "0.7"
+# In-process Ethereum signing + JSON-RPC for settle_epoch_onchain (C9 follow-up).
+# Replaces the prior `cast send` subprocess so the operator key never lands
+# in `/proc/<pid>/environ`. Pairs with alloy-core 0.7.x (sol-types/primitives).
+alloy-network = "0.2"
+alloy-provider = "0.2"
+alloy-signer = "0.2"
+alloy-signer-local = "0.2"
+alloy-transport-http = { version = "0.2", features = ["reqwest"] }
+alloy-rpc-types-eth = "0.2"
+alloy-consensus = "0.2"
+# sp1-sdk is referenced only from code gated behind `feature = "real-prover"`.
+sp1-sdk = { workspace = true, optional = true }
+
+[[bin]]
+name = "prism-orchestrator"
+path = "src/main.rs"
+
+[[example]]
+name = "extract_aggregator_vkey"
+path = "examples/extract_aggregator_vkey.rs"
+required-features = ["real-prover"]
