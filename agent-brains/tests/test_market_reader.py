@@ -85,6 +85,55 @@ class TestOnChainReader:
         assert isinstance(reader, OnChainMarketReader)
 
 
+class TestPoolIdEncoding:
+    """H13-full: validate PoolKey → keccak256 derivation."""
+
+    def test_pool_id_for_tracked_pool_matches_canonical_v4_encoding(self):
+        """
+        Independent re-encoding of PoolKey via eth-abi should match the
+        helper's output. This pins the call shape so any drift in eth-abi's
+        struct encoding becomes a visible test failure rather than a silent
+        on-chain RPC miss.
+        """
+        from common.market_reader import pool_id_for
+        from common.constants import (
+            POOL_USDC_WETH_030,
+            TRACKED_POOLS,
+        )
+        from eth_abi import encode as abi_encode
+        from eth_utils import keccak as keccak256
+
+        key = TRACKED_POOLS[POOL_USDC_WETH_030]
+        expected = keccak256(
+            abi_encode(
+                ["address", "address", "uint24", "int24", "address"],
+                [key.currency0, key.currency1, key.fee, key.tick_spacing, key.hooks],
+            )
+        )
+        actual = pool_id_for(POOL_USDC_WETH_030)
+        assert actual == expected
+        assert len(actual) == 32
+
+    def test_pool_id_for_untracked_pool_falls_back_to_padded_address(self):
+        """Pools without a registered PoolKey use the legacy zero-padded shape."""
+        from common.market_reader import pool_id_for
+
+        addr = "0x" + "ab" * 20
+        result = pool_id_for(addr)
+        assert len(result) == 32
+        # First 12 bytes are zero padding, last 20 are the address.
+        assert result[:12] == b"\x00" * 12
+        assert result[12:].hex() == "ab" * 20
+
+    def test_pool_id_is_deterministic(self):
+        from common.market_reader import pool_id_for
+        from common.constants import POOL_USDC_WETH_005
+
+        a = pool_id_for(POOL_USDC_WETH_005)
+        b = pool_id_for(POOL_USDC_WETH_005)
+        assert a == b
+
+
 class TestLiveRPC:
     """Live RPC tests — only run when UNICHAIN_RPC_URL is set."""
 

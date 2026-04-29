@@ -62,6 +62,71 @@ TARGET_PROTOCOL = "Uniswap"
 EPOCH_DURATION_SECS = 12
 WS_DEFAULT_URL = "ws://localhost:8765"
 
+# --- Uniswap V4 / Unichain Sepolia ---
+
+# PoolManager on Unichain Sepolia — used for getSlot0(PoolId) calls.
+UNISWAP_V4_POOL_MANAGER = "0x00B036B58a818B1BC34d502D3fE730Db729e62AC"
+
+# Default LP fee in ppm (3000 = 0.30%).  Used when the V4 on-chain read is
+# unavailable or the full PoolKey→PoolId derivation is not yet wired.
+DEFAULT_LP_FEE_PPM = 3_000
+
+
+# --- V4 PoolKey definitions (H13-full) ---
+#
+# A V4 PoolId is `keccak256(abi.encode(PoolKey))` where PoolKey is
+# `(address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks)`.
+# `currency0 < currency1` (lexicographic). The `hooks` slot is the deployed
+# PrismHook address; an unhooked pool sets it to the zero address.
+#
+# These two PoolKeys cover the demo's tracked pools — additional pools can be
+# appended without touching market_reader.py.
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class PoolKey:
+    """V4 PoolKey shape for `abi.encode((address,address,uint24,int24,address))`."""
+    currency0: str   # lower-cased 0x-prefixed address
+    currency1: str   # lower-cased 0x-prefixed address
+    fee: int         # uint24 — pool fee in pips (3000 = 0.30%)
+    tick_spacing: int  # int24
+    hooks: str       # lower-cased 0x-prefixed address (zero for unhooked)
+
+
+# Deployed PrismHook on Unichain Sepolia. Set after each redeploy.
+# Phase 6 of the audit-driven redeploy will rotate this to the new address.
+PRISM_HOOK_ADDRESS = "0x0b9ae4690f8b6eabb1511a6e1c64c948b9edcfc0"  # redeployed 2026-04-29 with Plan-B + schema-byte + reentrancy + capability rotation
+
+
+# Currency0 must sort before currency1 for V4 to accept the key. WETH < USDC
+# is false on this fixture (WETH = 0xc02..., USDC = 0xa0b...) — USDC sorts
+# first, so currency0 = USDC, currency1 = WETH.
+TRACKED_POOLS: dict[str, PoolKey] = {
+    POOL_USDC_WETH_030: PoolKey(
+        currency0=TOKEN_USDC,
+        currency1=TOKEN_WETH,
+        fee=3_000,
+        tick_spacing=60,
+        hooks=PRISM_HOOK_ADDRESS,
+    ),
+    POOL_USDC_WETH_005: PoolKey(
+        currency0=TOKEN_USDC,
+        currency1=TOKEN_WETH,
+        fee=500,
+        tick_spacing=10,
+        hooks=PRISM_HOOK_ADDRESS,
+    ),
+    POOL_USDC_WETH_060: PoolKey(
+        currency0=TOKEN_USDC,
+        currency1=TOKEN_WETH,
+        fee=10_000,
+        tick_spacing=200,
+        hooks=PRISM_HOOK_ADDRESS,
+    ),
+}
+
 # Action discriminators — must match Action::discriminator() in
 # crates/prism-types/src/lib.rs. Adding a new action type? Add it
 # here AND in commitment.py's _ACTION_DISCRIMINATORS.
