@@ -14,12 +14,6 @@ contract MockSP1Verifier is ISP1Verifier {
         );
     }
 
-    constructor() {
-        require(
-            block.chainid == 31337,
-            "Mock verifier restricted to local anvil network"
-        );
-    }
 
     function verifyProof(
         bytes32 /* programVKey */,
