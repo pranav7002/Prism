@@ -10,25 +10,21 @@ type Phase = typeof phases[number];
 const phaseDuration = 8; // seconds each
 
 const EpochTimeline = () => {
-  const { demo, wsUrl } = useDemoMode();
+  const { demo, wsUrl, demoPhaseIdx } = useDemoMode();
   const { events } = useWsEvents(wsUrl, !demo);
   const liveEpoch = !demo ? currentEpoch(events) : null;
 
-  const [activeIdx, setActiveIdx] = useState(2);
+  const activeIdx = demo ? demoPhaseIdx : 2; // fallback for live without events
   const [countdown, setCountdown] = useState(phaseDuration);
 
   useEffect(() => {
+    if (!demo) return;
+    setCountdown(phaseDuration);
     const t = setInterval(() => {
-      setCountdown((c) => {
-        if (c <= 1) {
-          setActiveIdx((i) => (i + 1) % phases.length);
-          return phaseDuration;
-        }
-        return c - 1;
-      });
+      setCountdown((c) => Math.max(0, c - 1));
     }, 1000);
     return () => clearInterval(t);
-  }, []);
+  }, [demoPhaseIdx, demo]);
 
   return (
     <div className="glass p-8">

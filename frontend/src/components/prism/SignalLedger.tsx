@@ -53,13 +53,18 @@ let liveAgentIdx = 0;
 function wsEventToSignal(e: WsEvent, id: number): Signal {
   const agent = liveAgentRoster[liveAgentIdx % liveAgentRoster.length];
   liveAgentIdx += 1;
+  
+  let realHash = "—"; // fallback for events with no hash
+  if (e.type === "solver_complete") realHash = e.plan_hash;
+  else if (e.type === "epoch_settled" || e.type === "epoch_settled_via_plan_b") realHash = e.tx_hash;
+
   return {
     id,
     ts: fmtTime(),
     agent,
     color: palette[agent],
     message: eventLabel(e),
-    hash: randHash(),
+    hash: realHash,
   };
 }
 
@@ -143,7 +148,7 @@ const SignalLedger = () => {
                   {s.agent}
                 </span>
                 <span className="text-sm text-foreground/90 truncate">{s.message}</span>
-                <span className="mono text-[11px] text-muted-foreground/80 text-right tabular">{s.hash}</span>
+                <span className="mono text-[11px] text-muted-foreground/80 text-right tabular truncate">{s.hash}</span>
               </div>
             );
           })}

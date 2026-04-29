@@ -17,7 +17,7 @@ type Phase = "generating" | "merging" | "wrapping" | "verified";
 const EMPTY_PROGRESS: Record<string, number> = { Solver: 0, Execution: 0, Shapley: 0 };
 
 const ProofPipeline = () => {
-  const { demo, wsUrl } = useDemoMode();
+  const { demo, wsUrl, demoPhaseIdx } = useDemoMode();
   const { events } = useWsEvents(wsUrl, !demo);
 
   // Live-derived progress (only used when !demo)
@@ -27,44 +27,50 @@ const ProofPipeline = () => {
   const [phase, setPhase] = useState<Phase>("generating");
   const [demoProgress, setDemoProgress] = useState<Record<string, number>>(EMPTY_PROGRESS);
 
-  // Demo animation — only runs when demo=true
+  // Demo animation — synchronized to global demoPhaseIdx
   useEffect(() => {
     if (!demo) return;
 
     let raf: ReturnType<typeof setTimeout>;
     let cancelled = false;
 
-    const cycle = () => {
+    if (demoPhaseIdx < 3) {
+      // 0: Commit, 1: Reveal, 2: Solve -> Reset
       setPhase("generating");
       setDemoProgress(EMPTY_PROGRESS);
+    } else if (demoPhaseIdx === 3) {
+      // 3: Prove -> Generate proofs over 8 seconds
+      setPhase("generating");
+      setDemoProgress(EMPTY_PROGRESS);
+      
       const tick = () => {
         if (cancelled) return;
         setDemoProgress((p) => {
           const next = {
-            Solver: Math.min(100, p.Solver + Math.random() * 4),
-            Execution: Math.min(100, p.Execution + Math.random() * 3.2),
-            Shapley: Math.min(100, p.Shapley + Math.random() * 4.6),
+            Solver: Math.min(100, p.Solver + Math.random() * 1.5),
+            Execution: Math.min(100, p.Execution + Math.random() * 1.2),
+            Shapley: Math.min(100, p.Shapley + Math.random() * 1.8),
           };
-          if (next.Solver >= 100 && next.Execution >= 100 && next.Shapley >= 100) {
-            setPhase("merging");
-            setTimeout(() => !cancelled && setPhase("wrapping"), 900);
-            setTimeout(() => !cancelled && setPhase("verified"), 1800);
-            setTimeout(() => !cancelled && cycle(), 4200);
-            return next;
+          if (next.Solver < 100 || next.Execution < 100 || next.Shapley < 100) {
+            raf = setTimeout(tick, 80);
           }
-          raf = setTimeout(tick, 80);
           return next;
         });
       };
       tick();
-    };
+    } else if (demoPhaseIdx === 4) {
+      // 4: Settle -> Aggregation and verification
+      setDemoProgress({ Solver: 100, Execution: 100, Shapley: 100 });
+      setPhase("merging");
+      setTimeout(() => !cancelled && setPhase("wrapping"), 1200);
+      setTimeout(() => !cancelled && setPhase("verified"), 2800);
+    }
 
-    cycle();
     return () => {
       cancelled = true;
       clearTimeout(raf);
     };
-  }, [demo]);
+  }, [demo, demoPhaseIdx]);
 
   // Determine which progress values to display
   const progress = hasLiveData ? liveProgress! : demoProgress;

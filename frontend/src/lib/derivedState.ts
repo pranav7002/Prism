@@ -4,6 +4,50 @@ import type { WsEvent } from "./wsClient";
 // WsEvent is an internally-tagged union (`type` field is the discriminator)
 // — see wsClient.ts.
 
+export interface EpochData {
+  epochId: number;
+  planHash?: string;
+  txHash?: string;
+  gasUsed?: number;
+  path?: "groth16" | "plan-b";
+  shapley?: number[];
+  startTime: number;
+  intentsProcessed?: number;
+  volumeUsd?: number;
+  baseFee?: number;
+}
+
+export function epochHistory(events: WsEvent[]): EpochData[] {
+  const history: EpochData[] = [];
+  let current: EpochData | null = null;
+
+  // Iterate chronologically (oldest first) so data accumulates correctly
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.type === "epoch_start") {
+      if (current) history.unshift(current); // newest at index 0
+      current = { epochId: e.epoch, startTime: e.timestamp };
+    } else if (current) {
+      if (e.type === "intents_received") current.intentsProcessed = e.count;
+      else if (e.type === "solver_complete") current.planHash = e.plan_hash;
+      else if (e.type === "epoch_settled") {
+        current.path = "groth16";
+        current.txHash = e.tx_hash;
+        current.gasUsed = e.gas_used;
+        current.shapley = e.shapley;
+      } else if (e.type === "epoch_settled_via_plan_b") {
+        current.path = "plan-b";
+        current.txHash = e.tx_hash;
+        current.gasUsed = e.gas_used;
+        current.shapley = e.shapley;
+      }
+    }
+  }
+  if (current) history.unshift(current);
+  
+  return history;
+}
+
 /** Last EpochStart.epoch seen, or null if none. */
 export function currentEpoch(events: WsEvent[]): number | null {
   for (const e of events) {
