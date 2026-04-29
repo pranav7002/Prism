@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import type { AgentKey } from "./AgentGlyph";
 import { useDemoMode } from "@/store/demoMode";
+import { useWsEvents } from "@/lib/wsClient";
 
 interface Orb {
   agent: AgentKey;
@@ -29,6 +30,9 @@ const intentStream = [
 ];
 
 const SwarmAbstraction = ({ onSelect }: { onSelect?: (a: AgentKey) => void }) => {
+  const { demo, wsUrl } = useDemoMode();
+  const { events } = useWsEvents(wsUrl, !demo);
+
   const ref = useRef<HTMLDivElement>(null);
   const [mouse, setMouse] = useState({ x: 0, y: 0 });
   const [active, setActive] = useState<AgentKey | null>(null);
@@ -45,14 +49,22 @@ const SwarmAbstraction = ({ onSelect }: { onSelect?: (a: AgentKey) => void }) =>
   }, []);
 
   useEffect(() => {
+    if (!demo) return;
     const t = setInterval(() => {
       setIntentIdx((i) => (i + 1) % intentStream.length);
     }, 3000);
     return () => clearInterval(t);
-  }, []);
+  }, [demo]);
 
   const radius = 200;
-  const currentIntent = intentStream[intentIdx];
+  
+  const liveIntent = events.length > 0 ? {
+    from: "SWARM",
+    to: "ORCHESTRATOR",
+    payload: { ...events[0] }
+  } : null;
+
+  const currentIntent = demo ? intentStream[intentIdx] : liveIntent;
 
   return (
     <div ref={ref} className="relative mx-auto h-[520px] w-[520px] max-w-full">
@@ -70,12 +82,18 @@ const SwarmAbstraction = ({ onSelect }: { onSelect?: (a: AgentKey) => void }) =>
           </div>
         </div>
         <div className="flex-1 p-3 flex flex-col justify-center">
-          <p className="mono text-[10px] text-muted-foreground mb-2">
-            Routing: <span className="text-white">{currentIntent.from} → {currentIntent.to}</span>
-          </p>
-          <pre className="mono text-[9px] text-[hsl(var(--primary))] leading-relaxed overflow-hidden">
-            {JSON.stringify(currentIntent.payload, null, 2)}
-          </pre>
+          {currentIntent ? (
+            <>
+              <p className="mono text-[10px] text-muted-foreground mb-2">
+                Routing: <span className="text-white">{currentIntent.from} → {currentIntent.to}</span>
+              </p>
+              <pre className="mono text-[9px] text-[hsl(var(--primary))] leading-relaxed overflow-hidden">
+                {JSON.stringify(currentIntent.payload, null, 2)}
+              </pre>
+            </>
+          ) : (
+            <p className="mono text-[10px] text-muted-foreground text-center">Listening for Live P2P Intents...</p>
+          )}
         </div>
       </motion.div>
 

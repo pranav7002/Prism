@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useDemoMode } from "@/store/demoMode";
-import { GitMerge, ArrowRightLeft, Layers, Cpu } from "lucide-react";
+import { GitMerge, ArrowRightLeft, Layers, Cpu, Activity } from "lucide-react";
 import { motion } from "framer-motion";
 
 const TelemetryMatrix = () => {
@@ -10,11 +10,24 @@ const TelemetryMatrix = () => {
   const [randomDelta, setRandomDelta] = useState(0);
   
   useEffect(() => {
+    if (!demo) return;
     const t = setInterval(() => {
       setRandomDelta(Math.floor(Math.random() * 9999));
     }, 4000);
     return () => clearInterval(t);
-  }, []);
+  }, [demo]);
+
+  if (!demo) {
+    return (
+      <div className="glass p-8 md:p-10 mb-6 flex flex-col items-center justify-center text-center" style={{ minHeight: 280 }}>
+        <Activity className="w-8 h-8 text-[hsl(var(--primary))] mb-4 animate-pulse" />
+        <p className="mono text-[11px] uppercase tracking-[0.14em] text-[hsl(var(--primary))]">Awaiting Live Hook Telemetry</p>
+        <p className="text-sm text-muted-foreground mt-2 max-w-sm">
+          Awaiting real-time Uniswap V4 pool state metrics from the orchestrator.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="glass p-8 md:p-10 mb-6">
