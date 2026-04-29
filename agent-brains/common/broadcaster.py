@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable, Optional
 
@@ -63,6 +64,9 @@ class IntentBroadcaster:
     is expected to be running at the configured ws_url.
     """
 
+    # Maximum number of messages buffered while disconnected.
+    _SEND_QUEUE_MAX = 100
+
     def __init__(self, config: BroadcasterConfig | None = None):
         self.config = config or BroadcasterConfig()
         self._ws: WebSocketClientProtocol | None = None
@@ -70,6 +74,9 @@ class IntentBroadcaster:
         self._listener_task: asyncio.Task | None = None
         self._event_callbacks: list[Callable[[dict], Awaitable[None]]] = []
         self._sent_count = 0
+        # H15: outbound queue — messages buffered during transient disconnects
+        # and replayed once the socket is re-established.
+        self._send_queue: deque[str] = deque(maxlen=self._SEND_QUEUE_MAX)
 
     async def connect(self) -> bool:
         """
@@ -113,28 +120,99 @@ class IntentBroadcaster:
         return False
 
     async def _listen_events(self):
-        """Background task: listen for orchestrator events."""
-        if not self._ws:
-            return
+        """
+        Background task: listen for orchestrator events.
 
-        try:
-            async for message in self._ws:
+        H15: On ConnectionClosed, attempts to reconnect with exponential
+        backoff (reusing connect()'s retry logic).  Replays the outbound
+        queue after each successful reconnect.  If all reconnect attempts
+        are exhausted the task exits and _connected is set to False.
+        """
+        reconnect_attempts = self.config.reconnect_attempts
+
+        while True:
+            if not self._ws:
+                return
+
+            try:
+                async for message in self._ws:
+                    try:
+                        event = json.loads(message)
+                        event_type = event.get("type", "unknown")
+                        logger.debug(f"Orchestrator event: {event_type}")
+                        for cb in self._event_callbacks:
+                            await cb(event)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            f"Non-JSON message from orchestrator: {message[:100]}"
+                        )
+                # Clean server-initiated close — no reconnect needed.
+                logger.info("Orchestrator closed the connection cleanly.")
+                self._connected = False
+                return
+
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.warning(f"Orchestrator connection closed mid-session: {e}")
+                self._connected = False
+
+            except Exception as e:
+                logger.error(f"Listener error: {e}")
+                self._connected = False
+
+            # --- Reconnect with backoff ---
+            if reconnect_attempts <= 0:
+                logger.error(
+                    "Mid-session reconnect exhausted all attempts; giving up."
+                )
+                return
+
+            delay = self.config.reconnect_base_delay
+            for attempt in range(1, reconnect_attempts + 1):
+                logger.info(
+                    f"Mid-session reconnect attempt "
+                    f"{attempt}/{reconnect_attempts} in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, self.config.reconnect_max_delay)
                 try:
-                    event = json.loads(message)
-                    event_type = event.get("type", "unknown")
-                    logger.debug(f"Orchestrator event: {event_type}")
-
-                    for cb in self._event_callbacks:
-                        await cb(event)
-
-                except json.JSONDecodeError:
-                    logger.warning(f"Non-JSON message from orchestrator: {message[:100]}")
-        except websockets.exceptions.ConnectionClosed as e:
-            logger.warning(f"Orchestrator connection closed: {e}")
-            self._connected = False
-        except Exception as e:
-            logger.error(f"Listener error: {e}")
-            self._connected = False
+                    self._ws = await websockets.connect(
+                        self.config.ws_url,
+                        ping_interval=self.config.ping_interval,
+                        ping_timeout=self.config.ping_timeout,
+                    )
+                    self._connected = True
+                    logger.info(
+                        f"Mid-session reconnect succeeded (attempt {attempt})"
+                    )
+                    # Replay buffered outbound messages
+                    if self._send_queue:
+                        logger.info(
+                            f"Replaying {len(self._send_queue)} queued messages"
+                        )
+                        while self._send_queue:
+                            queued = self._send_queue.popleft()
+                            try:
+                                await asyncio.wait_for(
+                                    self._ws.send(queued),
+                                    timeout=self.config.send_timeout,
+                                )
+                            except Exception as replay_err:
+                                logger.warning(
+                                    f"Queued message replay failed: {replay_err}"
+                                )
+                    break  # resume listening on new socket
+                except (
+                    ConnectionRefusedError,
+                    OSError,
+                    websockets.exceptions.WebSocketException,
+                ) as conn_err:
+                    logger.warning(f"Reconnect attempt {attempt} failed: {conn_err}")
+            else:
+                logger.error(
+                    "Mid-session reconnect exhausted all attempts; giving up."
+                )
+                self._connected = False
+                return
 
     def on_event(self, callback: Callable[[dict], Awaitable[None]]):
         """Register a callback for orchestrator events."""
@@ -148,21 +226,28 @@ class IntentBroadcaster:
         """
         commitment = intent.compute_commitment()
 
-        if not self._connected or not self._ws:
-            return BroadcastResult(
-                success=False,
-                agent_id=intent.agent_id,
-                epoch=intent.epoch,
-                commitment=commitment,
-                error="Not connected to orchestrator",
-            )
-
         wire_json = intent.to_wire_json()
         payload = json.dumps({
             "type": "SubmitIntent",
             "intent": wire_json,
             "commitment": commitment,
         })
+
+        if not self._connected or not self._ws:
+            # H15: buffer the message for replay once reconnected
+            self._send_queue.append(payload)
+            logger.info(
+                f"Queued intent for {intent.agent_id[:10]}... "
+                f"epoch={intent.epoch} (not connected, queue size "
+                f"{len(self._send_queue)})"
+            )
+            return BroadcastResult(
+                success=False,
+                agent_id=intent.agent_id,
+                epoch=intent.epoch,
+                commitment=commitment,
+                error="Not connected to orchestrator (queued for replay)",
+            )
 
         start = time.monotonic()
         try:
