@@ -40,11 +40,7 @@ contract PrismHook is IHooks {
     );
     event DynamicFeeUpdated(uint256 indexed epoch, uint24 newFee);
     event KillSwitchTriggered(uint256 indexed epoch, address indexed agent);
-    event EpochSettled(
-        uint256 indexed epoch,
-        uint16[] payouts,
-        address indexed settledBy
-    );
+    event EpochSettled(uint256 indexed epoch, uint16[] payouts, address indexed settledBy);
     event SwapTracked(uint256 indexed epoch, address indexed sender);
     event LiquidityTracked(
         uint256 indexed epoch,
