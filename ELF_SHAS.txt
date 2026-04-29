@@ -1,0 +1,14 @@
+# SP1 ELF artifact SHAs — defense against silent vkey drift.
+#
+# Each entry rotates when the corresponding `sp1-programs/<name>/src/main.rs`
+# changes. The aggregator's vkey (in AGGREGATOR_VKEY.txt) is keyed on its
+# own ELF only — sub-program vkeys come in via stdin at proof time, so a
+# sub-program rotation does NOT force an aggregator redeploy.
+#
+# Verify locally with: `make verify-elf`
+# Bump after rebuild with: `make refresh-elf-shas`
+
+solver-proof:    sha256:e04c3982bcc994426bf3b49e452fca6b7dbcf7ffb2c475774fc3c6dbab3882a7
+execution-proof: sha256:9d836bae42305ad260c2515214a7582dfcc0fe92aa9c7107543d6c0049c5e9a9
+shapley-proof:   sha256:81dd5f158e7e3cb8ad0e275c57ea552323514a5114fc064523b64d104ba4f635
+aggregator:      sha256:21fff9c557fa4179391bb3451b44daf7b953175edac921bc7523d20fab38acbe
