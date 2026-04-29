@@ -31,7 +31,7 @@ contract PrismHookTest is Test {
     function setUp() public {
         verifier = new MockSP1Verifier();
         aave = new MockAave();
-        hook = new PrismHook(IPoolManager(POOL_MANAGER), verifier, MOCK_VKEY);
+        hook = new PrismHook(IPoolManager(POOL_MANAGER), verifier, MOCK_VKEY, address(this));
 
         // Register 5 agents with appropriate capabilities.
         hook.registerAgent(
@@ -219,7 +219,7 @@ contract PrismHookTest is Test {
     }
 
     function test_settleEpoch_payoutSumMismatch() public {
-        uint16[] memory payouts = new uint16[](2);
+        uint16[] memory payouts = new uint16[](5);
         payouts[0] = 5000;
         payouts[1] = 4999; // sum = 9999, not 10000
 
@@ -236,7 +236,7 @@ contract PrismHookTest is Test {
         assertTrue(hook.killSwitchActive());
 
         // Settle clears kill-switch.
-        uint16[] memory payouts = new uint16[](1);
+        uint16[] memory payouts = new uint16[](5);
         payouts[0] = 10000;
         bytes memory publicValues = abi.encode(uint256(1), payouts);
         hook.settleEpoch(hex"CAFE", publicValues);
@@ -251,19 +251,22 @@ contract PrismHookTest is Test {
     function testFuzz_settleEpoch_payoutSum(
         uint16 a,
         uint16 b,
-        uint16 c
+        uint16 c,
+        uint16 d
     ) public {
         // Bound to prevent sum > 10000 overflow.
         a = uint16(bound(a, 0, 10000));
         b = uint16(bound(b, 0, 10000 - a));
         c = uint16(bound(c, 0, 10000 - a - b));
-        uint16 d = 10000 - a - b - c;
+        d = uint16(bound(d, 0, 10000 - a - b - c));
+        uint16 e = 10000 - a - b - c - d;
 
-        uint16[] memory payouts = new uint16[](4);
+        uint16[] memory payouts = new uint16[](5);
         payouts[0] = a;
         payouts[1] = b;
         payouts[2] = c;
         payouts[3] = d;
+        payouts[4] = e;
 
         bytes memory publicValues = abi.encode(uint256(1), payouts);
         hook.settleEpoch(hex"CAFE", publicValues);

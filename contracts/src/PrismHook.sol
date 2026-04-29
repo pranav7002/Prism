@@ -28,6 +28,7 @@ contract PrismHook is IHooks {
     error NotAuthorized();
     error PayoutSumMismatch();
     error EpochMismatch();
+    error LengthMismatch();
     error AgentAlreadyRegistered();
 
     // ─── Events ──────────────────────────────────────────────────
@@ -39,7 +40,7 @@ contract PrismHook is IHooks {
     );
     event DynamicFeeUpdated(uint256 indexed epoch, uint24 newFee);
     event KillSwitchTriggered(uint256 indexed epoch, address indexed agent);
-    event EpochSettled(uint256 indexed epoch, uint16[] payouts);
+    event EpochSettled(uint256 indexed epoch, uint16[] payouts, address indexed settledBy);
     event SwapTracked(uint256 indexed epoch, address indexed sender);
     event LiquidityTracked(
         uint256 indexed epoch,
@@ -113,28 +114,23 @@ contract PrismHook is IHooks {
     //  AGENT MANAGEMENT
     // ═══════════════════════════════════════════════════════════════
 
-    function getHookPermissions()
-        public
-        pure
-        returns (Hooks.Permissions memory)
-    {
-        return
-            Hooks.Permissions({
-                beforeInitialize: true,
-                afterInitialize: true,
-                beforeAddLiquidity: true,
-                afterAddLiquidity: true,
-                beforeRemoveLiquidity: true,
-                afterRemoveLiquidity: true,
-                beforeSwap: true,
-                afterSwap: true,
-                beforeDonate: true,
-                afterDonate: true,
-                beforeSwapReturnDelta: false,
-                afterSwapReturnDelta: false,
-                afterAddLiquidityReturnDelta: false,
-                afterRemoveLiquidityReturnDelta: false
-            });
+    function getHookPermissions() public pure returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeInitialize: true,
+            afterInitialize: true,
+            beforeAddLiquidity: true,
+            afterAddLiquidity: true,
+            beforeRemoveLiquidity: true,
+            afterRemoveLiquidity: true,
+            beforeSwap: true,
+            afterSwap: true,
+            beforeDonate: true,
+            afterDonate: true,
+            beforeSwapReturnDelta: false,
+            afterSwapReturnDelta: false,
+            afterAddLiquidityReturnDelta: false,
+            afterRemoveLiquidityReturnDelta: false
+        });
     }
 
     function transferOwnership(address newOwner) external onlyOwner {
@@ -212,7 +208,10 @@ contract PrismHook is IHooks {
         // 3. Epoch must match.
         if (epoch != currentEpoch) revert EpochMismatch();
 
-        // 4. Payouts must sum to exactly 10000 bps.
+        // 4. Payouts length must match registered agents (M6 Fix).
+        if (payouts.length != agentList.length) revert LengthMismatch();
+
+        // 5. Payouts must sum to exactly 10000 bps.
         uint256 sum = 0;
         for (uint256 i = 0; i < payouts.length; i++) {
             sum += payouts[i];
@@ -222,11 +221,11 @@ contract PrismHook is IHooks {
         // 5. Store payouts.
         epochPayouts[currentEpoch] = payouts;
 
-        // 6. Advance epoch, clear kill-switch.
+        // 7. Advance epoch, clear kill-switch.
         currentEpoch++;
         killSwitchActive = false;
 
-        emit EpochSettled(epoch, payouts);
+        emit EpochSettled(epoch, payouts, msg.sender);
     }
 
     /// @notice Read the Shapley payouts for a given epoch.
@@ -254,11 +253,7 @@ contract PrismHook is IHooks {
         if (killSwitchActive) revert KillSwitchActive();
 
         if (registeredAgents[sender]) {
-            if (
-                !agentCaps[sender].canSwap &&
-                !agentCaps[sender].canBackrun &&
-                !agentCaps[sender].canHedge
-            ) revert NotAuthorized();
+            if (!agentCaps[sender].canSwap && !agentCaps[sender].canBackrun && !agentCaps[sender].canHedge) revert NotAuthorized();
         }
 
         // 2. Return the dynamic fee set by β.
