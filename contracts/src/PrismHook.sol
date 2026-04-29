@@ -1,0 +1,527 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {
+    BeforeSwapDelta,
+    BeforeSwapDeltaLibrary
+} from "v4-core/src/types/BeforeSwapDelta.sol";
+import {ISP1Verifier} from "@sp1-contracts/ISP1Verifier.sol";
+import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+/// @title PrismHook
+/// @notice Uniswap V4 Hook that coordinates a swarm of 5 AI agents.
+///         Verifies ZK proofs (SP1 Groth16) and distributes Shapley-fair
+///         payouts each epoch.
+///
+///         Replaces the old PrismCoordinator + PaymentSplitter + AgentRegistry.
+///
+///         Public values are transport-prefixed with a 1-byte schema version.
+///         The version byte is **advisory** (not bound by the proof) — the
+///         contract verifies the proof against the inner publicValues only.
+///         Future schema rotations should bump SCHEMA_VERSION and embed the
+///         version inside the proven payload.
+contract PrismHook is IHooks, ReentrancyGuard {
+    // ─── Errors ──────────────────────────────────────────────────
+    error NotPoolManager();
+    error NotRegisteredAgent();
+    error KillSwitchActive();
+    error NoCommitmentThisEpoch();
+    error NotAuthorized();
+    error NotOperator();
+    error PayoutSumMismatch();
+    error PayoutAgentMismatch();
+    error EpochMismatch();
+    error AgentAlreadyRegistered();
+    error SchemaVersionUnsupported();
+    error EmptyPublicValues();
+    error SubVkeysNotSet();
+    error SubVkeysFrozen();
+    error AgentNotRegistered();
+    error RevokedAgentMustHaveZeroPayout();
+
+    // ─── Events ──────────────────────────────────────────────────
+    event AgentRegistered(address indexed agent);
+    event IntentCommitted(
+        uint256 indexed epoch,
+        address indexed agent,
+        bytes32 commitment
+    );
+    event DynamicFeeUpdated(uint256 indexed epoch, uint24 newFee);
+    event KillSwitchTriggered(uint256 indexed epoch, address indexed agent);
+    event EpochSettled(uint256 indexed epoch, uint16[] payouts, address indexed settledBy);
+    event EpochSettledViaPlanB(uint256 indexed epoch, uint16[] payouts, address indexed settledBy);
+    event SwapTracked(uint256 indexed epoch, address indexed sender);
+    event LiquidityTracked(
+        uint256 indexed epoch,
+        address indexed sender,
+        bool isAdd
+    );
+    event OperatorAdded(address indexed operator);
+    event OperatorRemoved(address indexed operator);
+    event AgentRevoked(address indexed agent);
+    event AgentCapsUpdated(address indexed agent, AgentCapabilities caps);
+    event SubVkeysSet(bytes32 solver, bytes32 execution, bytes32 shapley);
+    event SubVkeysFrozenEvent();
+
+    // ─── Constants ───────────────────────────────────────────────
+    /// @notice Outer-wrapper schema version for `publicValues`. The byte is
+    ///         **advisory** — it is not bound by the proof. See contract NatSpec.
+    uint8 public constant SCHEMA_VERSION = 1;
+
+    // ─── Immutables ──────────────────────────────────────────────
+    IPoolManager public immutable poolManager;
+    ISP1Verifier public immutable zkVerifier;
+    bytes32 public immutable AGGREGATOR_VKEY;
+
+    // ─── Agent Capabilities ──────────────────────────────────────
+    struct AgentCapabilities {
+        bool canLP; // α, γ
+        bool canSwap; // δ
+        bool canBackrun; // δ
+        bool canHedge; // ε
+        bool canSetFee; // β
+        bool canKillSwitch; // ε
+    }
+
+    // ─── State ───────────────────────────────────────────────────
+    address public owner;
+    uint256 public currentEpoch;
+    bool public killSwitchActive;
+    uint24 public currentDynamicFee;
+
+    mapping(address => bool) public operators;
+    mapping(address => bool) public registeredAgents;
+    mapping(address => AgentCapabilities) public agentCaps;
+    address[] public agentList; // ordered for payout indexing
+
+    /// Revocation mapping: a revoked agent stays in `agentList` (so payout
+    /// indexing remains stable across epochs) but their slot must always
+    /// receive 0 bps in subsequent settlements. Cleared by re-registration is
+    /// not supported; revoked agents are permanently disabled.
+    mapping(address => bool) public revoked;
+
+    /// Plan-B sub-program verifying keys. Set post-deploy via `setSubVkeys`
+    /// (avoids inflating the HookMiner CREATE2 search space). Once
+    /// `subVkeysFrozen` is true, the values are immutable.
+    bytes32 public solverVkey;
+    bytes32 public executionVkey;
+    bytes32 public shapleyVkey;
+    bool public subVkeysFrozen;
+
+    /// epoch → agent → commitment hash
+    mapping(uint256 => mapping(address => bytes32)) public commitments;
+
+    /// epoch → Shapley basis-point payouts (sum == 10000)
+    mapping(uint256 => uint16[]) public epochPayouts;
+
+    // ─── Modifiers ───────────────────────────────────────────────
+    modifier onlyPoolManager() {
+        if (msg.sender != address(poolManager)) revert NotPoolManager();
+        _;
+    }
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert NotAuthorized();
+        _;
+    }
+
+    modifier onlyOperator() {
+        if (!operators[msg.sender]) revert NotOperator();
+        _;
+    }
+
+    modifier onlyRegistered() {
+        if (!registeredAgents[msg.sender]) revert NotRegisteredAgent();
+        _;
+    }
+
+    // ─── Constructor ─────────────────────────────────────────────
+    constructor(
+        IPoolManager _poolManager,
+        ISP1Verifier _zkVerifier,
+        bytes32 _aggregatorVkey,
+        address initialOwner
+    ) {
+        poolManager = _poolManager;
+        zkVerifier = _zkVerifier;
+        AGGREGATOR_VKEY = _aggregatorVkey;
+        owner = initialOwner;
+        currentEpoch = 1;
+        currentDynamicFee = 3000; // 0.30% default
+        operators[initialOwner] = true;
+        emit OperatorAdded(initialOwner);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  AGENT MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════
+
+    function getHookPermissions() public pure returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeInitialize: false,
+            afterInitialize: false,
+            beforeAddLiquidity: true,
+            afterAddLiquidity: true,
+            beforeRemoveLiquidity: true,
+            afterRemoveLiquidity: true,
+            beforeSwap: true,
+            afterSwap: true,
+            beforeDonate: false,
+            afterDonate: false,
+            beforeSwapReturnDelta: false,
+            afterSwapReturnDelta: false,
+            afterAddLiquidityReturnDelta: false,
+            afterRemoveLiquidityReturnDelta: false
+        });
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        owner = newOwner;
+    }
+
+    function addOperator(address op) external onlyOwner {
+        operators[op] = true;
+        emit OperatorAdded(op);
+    }
+
+    function removeOperator(address op) external onlyOwner {
+        operators[op] = false;
+        emit OperatorRemoved(op);
+    }
+
+    function clearKillSwitch() external onlyOwner {
+        killSwitchActive = false;
+    }
+
+    /// @notice Register an agent with specific capabilities.
+    function registerAgent(
+        address agent,
+        AgentCapabilities calldata caps
+    ) external onlyOwner {
+        if (registeredAgents[agent]) revert AgentAlreadyRegistered();
+        registeredAgents[agent] = true;
+        agentCaps[agent] = caps;
+        agentList.push(agent);
+        emit AgentRegistered(agent);
+    }
+
+    /// @notice Returns the number of registered agents.
+    function agentCount() external view returns (uint256) {
+        return agentList.length;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  AGENT ACTIONS
+    // ═══════════════════════════════════════════════════════════════
+
+    /// @notice Commit an intent hash for the current epoch.
+    ///         Matches keccak256 from `AgentIntent::compute_commitment`.
+    function commitIntent(bytes32 commitment) external onlyRegistered {
+        commitments[currentEpoch][msg.sender] = commitment;
+        emit IntentCommitted(currentEpoch, msg.sender, commitment);
+    }
+
+    /// @notice β sets the dynamic fee (in hundredths of a bip, e.g. 3000 = 0.30%).
+    function setDynamicFee(uint24 newFee) external onlyRegistered {
+        if (!agentCaps[msg.sender].canSetFee) revert NotAuthorized();
+        require(newFee <= LPFeeLibrary.MAX_LP_FEE, "Fee exceeds max");
+        currentDynamicFee = newFee;
+        emit DynamicFeeUpdated(currentEpoch, newFee);
+    }
+
+    /// @notice ε triggers the kill-switch — all subsequent swaps revert.
+    function triggerKillSwitch() external onlyRegistered {
+        if (!agentCaps[msg.sender].canKillSwitch) revert NotAuthorized();
+        killSwitchActive = true;
+        emit KillSwitchTriggered(currentEpoch, msg.sender);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  EPOCH SETTLEMENT (ZK-VERIFIED)
+    // ═══════════════════════════════════════════════════════════════
+
+    /// @notice Settles one epoch by verifying the aggregated ZK proof and
+    ///         recording Shapley payouts.
+    /// @param proof  Groth16 proof bytes from SP1.
+    /// @param publicValues  `[SCHEMA_VERSION] || abi.encode(uint256 epoch, uint16[] payouts)`.
+    ///                      The leading byte is an advisory transport-layer
+    ///                      schema version; the proof is bound to the inner
+    ///                      bytes only (see contract NatSpec).
+    function settleEpoch(
+        bytes calldata proof,
+        bytes calldata publicValues
+    ) external onlyOperator nonReentrant {
+        bytes calldata innerPv = _unwrapSchema(publicValues);
+
+        // 1. Verify the ZK proof against the inner public values.
+        zkVerifier.verifyProof(AGGREGATOR_VKEY, innerPv, proof);
+
+        // 2. Decode public values.
+        (uint256 epoch, uint16[] memory payouts) = abi.decode(
+            innerPv,
+            (uint256, uint16[])
+        );
+
+        _recordSettlement(epoch, payouts);
+        emit EpochSettled(epoch, payouts, msg.sender);
+    }
+
+    /// @notice Plan-B settlement: when the Groth16 wrap times out, settle
+    ///         using the three sub-proofs directly. Each sub-proof's public
+    ///         values are schema-byte-prefixed; the contract verifies each
+    ///         sub-proof against its respective sub-vkey.
+    ///
+    ///         Trust model: Plan-B verifies the sub-STARKs but trusts the
+    ///         operator to relay `(epoch, payouts)` from the off-chain
+    ///         aggregator faithfully — the aggregator's cross-binding is not
+    ///         re-executed on-chain. The `onlyOperator` gate is the trust
+    ///         anchor. Use only when the Groth16 wrap path is unavailable.
+    /// @param solverProof    Groth16 proof bytes from the solver-proof program.
+    /// @param solverPv       `[SCHEMA_VERSION] || solver public values`.
+    /// @param executionProof Groth16 proof bytes from the execution-proof program.
+    /// @param executionPv    `[SCHEMA_VERSION] || execution public values`.
+    /// @param shapleyProof   Groth16 proof bytes from the shapley-proof program.
+    /// @param shapleyPv      `[SCHEMA_VERSION] || shapley public values`.
+    /// @param epoch          Epoch to settle (must equal `currentEpoch`).
+    /// @param payouts        Basis-point Shapley payouts (sum == 10000).
+    function settleEpochThreeProof(
+        bytes calldata solverProof,
+        bytes calldata solverPv,
+        bytes calldata executionProof,
+        bytes calldata executionPv,
+        bytes calldata shapleyProof,
+        bytes calldata shapleyPv,
+        uint256 epoch,
+        uint16[] calldata payouts
+    ) external onlyOperator nonReentrant {
+        if (solverVkey == bytes32(0) || executionVkey == bytes32(0) || shapleyVkey == bytes32(0)) {
+            revert SubVkeysNotSet();
+        }
+
+        zkVerifier.verifyProof(solverVkey, _unwrapSchema(solverPv), solverProof);
+        zkVerifier.verifyProof(executionVkey, _unwrapSchema(executionPv), executionProof);
+        zkVerifier.verifyProof(shapleyVkey, _unwrapSchema(shapleyPv), shapleyProof);
+
+        // Materialize a memory copy so `_recordSettlement` can read uniformly.
+        uint16[] memory payoutsMem = new uint16[](payouts.length);
+        for (uint256 i = 0; i < payouts.length; i++) {
+            payoutsMem[i] = payouts[i];
+        }
+        _recordSettlement(epoch, payoutsMem);
+        emit EpochSettledViaPlanB(epoch, payoutsMem, msg.sender);
+    }
+
+    /// @dev Strip the leading SCHEMA_VERSION byte from a public-values blob.
+    function _unwrapSchema(bytes calldata publicValues) internal pure returns (bytes calldata) {
+        if (publicValues.length == 0) revert EmptyPublicValues();
+        if (uint8(publicValues[0]) != SCHEMA_VERSION) revert SchemaVersionUnsupported();
+        return publicValues[1:];
+    }
+
+    /// @dev Common epoch-bookkeeping logic shared by both settlement paths.
+    function _recordSettlement(uint256 epoch, uint16[] memory payouts) internal {
+        // Epoch must match.
+        if (epoch != currentEpoch) revert EpochMismatch();
+
+        // Payouts length must match registered agents (M6 Fix).
+        if (payouts.length != agentList.length) revert PayoutAgentMismatch();
+
+        // Payouts must sum to exactly 10000 bps; revoked agents must hold 0.
+        uint256 sum = 0;
+        for (uint256 i = 0; i < payouts.length; i++) {
+            if (revoked[agentList[i]] && payouts[i] != 0) {
+                revert RevokedAgentMustHaveZeroPayout();
+            }
+            sum += payouts[i];
+        }
+        if (sum != 10000) revert PayoutSumMismatch();
+
+        epochPayouts[currentEpoch] = payouts;
+        currentEpoch++;
+        killSwitchActive = false;
+    }
+
+    /// @notice Set the Plan-B sub-program vkeys (one-shot post-deploy).
+    ///         Reverts if `freezeSubVkeys()` has been called.
+    function setSubVkeys(bytes32 solver, bytes32 execution, bytes32 shapley) external onlyOwner {
+        if (subVkeysFrozen) revert SubVkeysFrozen();
+        solverVkey = solver;
+        executionVkey = execution;
+        shapleyVkey = shapley;
+        emit SubVkeysSet(solver, execution, shapley);
+    }
+
+    /// @notice Permanently freeze the sub-vkey slots. Recommended once the
+    ///         Plan-B path has been validated end-to-end.
+    function freezeSubVkeys() external onlyOwner {
+        subVkeysFrozen = true;
+        emit SubVkeysFrozenEvent();
+    }
+
+    /// @notice Mark a registered agent as revoked. The agent stays in
+    ///         `agentList` to preserve payout-index stability across epochs;
+    ///         subsequent settlements MUST allocate 0 bps to a revoked slot.
+    ///         The off-chain solver is responsible for emitting `0` for
+    ///         revoked agents.
+    function revokeAgent(address agent) external onlyOwner {
+        if (!registeredAgents[agent]) revert AgentNotRegistered();
+        revoked[agent] = true;
+        emit AgentRevoked(agent);
+    }
+
+    /// @notice Update an agent's capability flags (capability rotation).
+    function updateAgentCaps(address agent, AgentCapabilities calldata caps) external onlyOwner {
+        if (!registeredAgents[agent]) revert AgentNotRegistered();
+        agentCaps[agent] = caps;
+        emit AgentCapsUpdated(agent, caps);
+    }
+
+    /// @notice Read the Shapley payouts for a given epoch.
+    function getPayouts(uint256 epoch) external view returns (uint16[] memory) {
+        return epochPayouts[epoch];
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  V4 HOOK CALLBACKS
+    // ═══════════════════════════════════════════════════════════════
+
+    // ── beforeSwap ───────────────────────────────────────────────
+    function beforeSwap(
+        address sender,
+        PoolKey calldata,
+        IPoolManager.SwapParams calldata,
+        bytes calldata
+    )
+        external
+        virtual
+        onlyPoolManager
+        returns (bytes4, BeforeSwapDelta, uint24)
+    {
+        // 1. Kill-switch blocks ALL swaps.
+        if (killSwitchActive) revert KillSwitchActive();
+
+        if (registeredAgents[sender]) {
+            if (!agentCaps[sender].canSwap && !agentCaps[sender].canBackrun && !agentCaps[sender].canHedge) revert NotAuthorized();
+        }
+
+        // 2. Return the dynamic fee set by β.
+        return (
+            IHooks.beforeSwap.selector,
+            BeforeSwapDeltaLibrary.ZERO_DELTA,
+            currentDynamicFee
+        );
+    }
+
+    // ── afterSwap ────────────────────────────────────────────────
+    function afterSwap(
+        address sender,
+        PoolKey calldata,
+        IPoolManager.SwapParams calldata,
+        BalanceDelta,
+        bytes calldata
+    ) external virtual onlyPoolManager returns (bytes4, int128) {
+        emit SwapTracked(currentEpoch, sender);
+        return (IHooks.afterSwap.selector, 0);
+    }
+
+    // ── beforeAddLiquidity ───────────────────────────────────────
+    function beforeAddLiquidity(
+        address sender,
+        PoolKey calldata,
+        IPoolManager.ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external virtual onlyPoolManager returns (bytes4) {
+        // Registered agents must have committed this epoch.
+        if (registeredAgents[sender]) {
+            if (!agentCaps[sender].canLP) revert NotAuthorized();
+            if (commitments[currentEpoch][sender] == bytes32(0)) {
+                revert NoCommitmentThisEpoch();
+            }
+        }
+        return IHooks.beforeAddLiquidity.selector;
+    }
+
+    // ── afterAddLiquidity ────────────────────────────────────────
+    function afterAddLiquidity(
+        address sender,
+        PoolKey calldata,
+        IPoolManager.ModifyLiquidityParams calldata,
+        BalanceDelta,
+        BalanceDelta,
+        bytes calldata
+    ) external virtual onlyPoolManager returns (bytes4, BalanceDelta) {
+        emit LiquidityTracked(currentEpoch, sender, true);
+        return (IHooks.afterAddLiquidity.selector, BalanceDelta.wrap(0));
+    }
+
+    // ── beforeRemoveLiquidity ────────────────────────────────────
+    function beforeRemoveLiquidity(
+        address sender,
+        PoolKey calldata,
+        IPoolManager.ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external virtual onlyPoolManager returns (bytes4) {
+        if (killSwitchActive) revert KillSwitchActive();
+        if (registeredAgents[sender]) {
+            if (!agentCaps[sender].canLP) revert NotAuthorized();
+        }
+        return IHooks.beforeRemoveLiquidity.selector;
+    }
+
+    // ── afterRemoveLiquidity ─────────────────────────────────────
+    function afterRemoveLiquidity(
+        address sender,
+        PoolKey calldata,
+        IPoolManager.ModifyLiquidityParams calldata,
+        BalanceDelta,
+        BalanceDelta,
+        bytes calldata
+    ) external virtual onlyPoolManager returns (bytes4, BalanceDelta) {
+        emit LiquidityTracked(currentEpoch, sender, false);
+        return (IHooks.afterRemoveLiquidity.selector, BalanceDelta.wrap(0));
+    }
+
+    // ── Unused callbacks (no-op) ─────────────────────────────────
+    function beforeInitialize(
+        address,
+        PoolKey calldata,
+        uint160
+    ) external virtual onlyPoolManager returns (bytes4) {
+        return IHooks.beforeInitialize.selector;
+    }
+
+    function afterInitialize(
+        address,
+        PoolKey calldata,
+        uint160,
+        int24
+    ) external virtual onlyPoolManager returns (bytes4) {
+        return IHooks.afterInitialize.selector;
+    }
+
+    function beforeDonate(
+        address,
+        PoolKey calldata,
+        uint256,
+        uint256,
+        bytes calldata
+    ) external virtual onlyPoolManager returns (bytes4) {
+        return IHooks.beforeDonate.selector;
+    }
+
+    function afterDonate(
+        address,
+        PoolKey calldata,
+        uint256,
+        uint256,
+        bytes calldata
+    ) external virtual onlyPoolManager returns (bytes4) {
+        return IHooks.afterDonate.selector;
+    }
+}
