@@ -322,49 +322,96 @@ async fn run_epoch_loop(
         )
         .await
         {
-            Ok(proof) => {
-                // Gas is constant O(1) — ~260k for the Groth16 pairing check
-                // plus small settlement logic.
-                let gas_used: u64 = 260_000;
-                // Use actual Shapley weights from the solver's execution plan
-                // instead of hardcoded values.
-                let shapley: Vec<u16> = proof
-                    .shapley_weights
+            Ok(outcome) => {
+                let shapley: Vec<u16> = outcome
+                    .shapley_weights()
                     .iter()
                     .map(|(_, w)| *w)
                     .collect();
 
-                // Attempt on-chain settlement if configured, else mock.
-                let tx_hash_hex = if let Some(sc) = &settlement_config {
-                    match settlement::settle_epoch_onchain(
-                        sc, epoch, &proof.proof_bytes, &proof.public_values,
-                    ).await {
-                        Ok(hash) => hash,
-                        Err(e) => {
-                            error!("epoch {}: on-chain settlement failed: {} — using mock tx", epoch, e);
+                match outcome {
+                    proving::AggregateOutcome::Wrapped(proof) => {
+                        // Gas is constant O(1) — ~260k for the Groth16 pairing
+                        // check plus small settlement logic.
+                        let gas_used: u64 = 260_000;
+                        let tx_hash_hex = if let Some(sc) = &settlement_config {
+                            match settlement::settle_epoch_onchain(
+                                sc, epoch, &proof.proof_bytes, &proof.public_values,
+                            ).await {
+                                Ok(hash) => hash,
+                                Err(e) => {
+                                    error!(
+                                        "epoch {}: on-chain settlement failed: {} — using mock tx",
+                                        epoch, e
+                                    );
+                                    let mock = mock_tx_hash(epoch, &proof.proof_bytes);
+                                    format!("0x{}", hex::encode(mock))
+                                }
+                            }
+                        } else {
                             let mock = mock_tx_hash(epoch, &proof.proof_bytes);
                             format!("0x{}", hex::encode(mock))
-                        }
-                    }
-                } else {
-                    let mock = mock_tx_hash(epoch, &proof.proof_bytes);
-                    format!("0x{}", hex::encode(mock))
-                };
+                        };
 
-                let settled = WsEvent::EpochSettled {
-                    tx_hash: tx_hash_hex.clone(),
-                    gas_used,
-                    shapley: shapley.clone(),
-                };
-                let _ = event_tx.send(settled);
-                info!(
-                    "epoch {} settled (tx {}): proof={}B gas={} shapley={:?}",
-                    epoch,
-                    tx_hash_hex,
-                    proof.proof_bytes.len(),
-                    gas_used,
-                    shapley,
-                );
+                        let _ = event_tx.send(WsEvent::EpochSettled {
+                            tx_hash: tx_hash_hex.clone(),
+                            gas_used,
+                            shapley: shapley.clone(),
+                        });
+                        info!(
+                            "epoch {} settled (tx {}): proof={}B gas={} shapley={:?}",
+                            epoch,
+                            tx_hash_hex,
+                            proof.proof_bytes.len(),
+                            gas_used,
+                            shapley,
+                        );
+                    }
+                    proving::AggregateOutcome::PlanB(p) => {
+                        // Plan-B settles via three independent sub-proof
+                        // verifications. Gas is ~3× the Groth16 path.
+                        let gas_used: u64 = 480_000;
+                        let tx_hash_hex = if let Some(sc) = &settlement_config {
+                            match settlement::settle_epoch_three_proof_onchain(
+                                sc,
+                                p.epoch,
+                                &p.solver.proof_bytes, &p.solver.public_values,
+                                &p.execution.proof_bytes, &p.execution.public_values,
+                                &p.shapley.proof_bytes, &p.shapley.public_values,
+                                &p.payouts_bps,
+                            ).await {
+                                Ok(hash) => hash,
+                                Err(e) => {
+                                    error!(
+                                        "epoch {}: Plan-B settlement failed: {} — using mock tx",
+                                        epoch, e
+                                    );
+                                    let mock = mock_tx_hash(epoch, &p.solver.proof_bytes);
+                                    format!("0x{}", hex::encode(mock))
+                                }
+                            }
+                        } else {
+                            let mock = mock_tx_hash(epoch, &p.solver.proof_bytes);
+                            format!("0x{}", hex::encode(mock))
+                        };
+
+                        let _ = event_tx.send(WsEvent::EpochSettledViaPlanB {
+                            tx_hash: tx_hash_hex.clone(),
+                            gas_used,
+                            shapley: shapley.clone(),
+                        });
+                        info!(
+                            "epoch {} settled via Plan-B (tx {}): solver={}B exec={}B shapley_proof={}B gas={} shapley={:?}",
+                            epoch,
+                            tx_hash_hex,
+                            p.solver.proof_bytes.len(),
+                            p.execution.proof_bytes.len(),
+                            p.shapley.proof_bytes.len(),
+                            gas_used,
+                            shapley,
+                        );
+                    }
+                }
             }
             Err(e) => {
                 error!("epoch {} failed: {}", epoch, e);

@@ -448,6 +448,14 @@ pub enum WsEvent {
         gas_used: u64,
         shapley: Vec<u16>,
     },
+    /// Settlement via the Plan-B three-proof fallback. Same payload shape as
+    /// `EpochSettled`; the discriminator lets the frontend show a "PLAN-B"
+    /// pill and badge the row distinctly.
+    EpochSettledViaPlanB {
+        tx_hash: String,
+        gas_used: u64,
+        shapley: Vec<u16>,
+    },
     /// Fatal epoch-level error.
     Error {
         message: String,
@@ -955,6 +963,23 @@ mod tests {
         let s = e.to_json();
         assert!(s.contains(r#""type":"epoch_settled""#));
         assert!(s.contains(r#""gas_used":260000"#));
+        let round: WsEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(round, e);
+    }
+
+    #[test]
+    fn ws_event_epoch_settled_via_plan_b_roundtrip() {
+        let e = WsEvent::EpochSettledViaPlanB {
+            tx_hash: "0xfeed".into(),
+            gas_used: 480_000,
+            shapley: vec![4000, 2500, 2000, 1500, 0],
+        };
+        let s = e.to_json();
+        assert!(
+            s.contains(r#""type":"epoch_settled_via_plan_b""#),
+            "shape was: {}",
+            s
+        );
         let round: WsEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(round, e);
     }

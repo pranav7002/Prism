@@ -98,6 +98,46 @@ pub struct AggregatedProof {
     pub shapley_weights: Vec<(AgentId, u16)>,
 }
 
+/// One of the three sub-proofs as it leaves the orchestrator on the Plan-B
+/// fallback path — the on-chain hook will verify each independently.
+pub struct PlanBChild {
+    pub proof_bytes: Vec<u8>,
+    /// Schema-byte-prefixed public values: `[SCHEMA_VERSION] || inner_pv`.
+    pub public_values: Vec<u8>,
+}
+
+/// Plan-B settlement payload: three sub-proofs the on-chain hook verifies
+/// independently, plus the off-chain-claimed `(epoch, payouts)`. See the
+/// `settleEpochThreeProof` NatSpec on `PrismHook` for the trust model.
+pub struct PlanBPayload {
+    pub epoch: u64,
+    pub payouts_bps: Vec<u16>,
+    pub shapley_weights: Vec<(AgentId, u16)>,
+    pub solver: PlanBChild,
+    pub execution: PlanBChild,
+    pub shapley: PlanBChild,
+}
+
+/// Outcome of a single epoch's proving pipeline. The happy path produces a
+/// recursively-aggregated `Wrapped` Groth16; if either the aggregator or the
+/// Groth16 wrap fails, we fall back to `PlanB` — three independently-wrapped
+/// sub-proofs the contract verifies one-by-one.
+pub enum AggregateOutcome {
+    Wrapped(AggregatedProof),
+    PlanB(PlanBPayload),
+}
+
+impl AggregateOutcome {
+    /// Borrowed slice of `(AgentId, u16)` Shapley weights, regardless of
+    /// which path produced this outcome.
+    pub fn shapley_weights(&self) -> &[(AgentId, u16)] {
+        match self {
+            AggregateOutcome::Wrapped(w) => &w.shapley_weights,
+            AggregateOutcome::PlanB(p) => &p.shapley_weights,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Real prover (feature-gated)
 // ---------------------------------------------------------------------------
@@ -213,7 +253,7 @@ pub async fn prove_epoch(
     protocol_state: ProtocolState,
     health_factor: HealthFactor,
     event_tx: broadcast::Sender<WsEvent>,
-) -> anyhow::Result<AggregatedProof> {
+) -> anyhow::Result<AggregateOutcome> {
     // Solver phase. Detect conflicts ahead of build_execution_plan so the
     // SolverRunning event carries the real count (H3) and any unresolvable
     // conflict surfaces structurally rather than as a flat anyhow string
@@ -306,7 +346,39 @@ pub async fn prove_epoch(
     // produces the same bytes locally and stuffs them into the mock proof's
     // `public_values`.
     let payouts_bps: Vec<u16> = shapley_weights.iter().map(|(_, w)| *w).collect();
-    let mock_public_values = encode_public_values_abi(plan_epoch, &payouts_bps);
+    let inner_public_values = encode_public_values_abi(plan_epoch, &payouts_bps);
+
+    // Plan-B sentinel — when set, skip the aggregator + Groth16 wrap and
+    // emit three sub-proofs directly. Useful for end-to-end testing the
+    // Plan-B path without waiting for an actual Groth16 timeout. On the real
+    // path this would also trigger if `run_aggregator_real` returned an Err
+    // (out of scope for this iteration; behavior is documented).
+    let force_plan_b = std::env::var("PRISM_FORCE_PLAN_B")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if force_plan_b {
+        let plan_b_payload = build_plan_b_mock(
+            plan_epoch,
+            &payouts_bps,
+            &shapley_weights,
+            &solver_artifact,
+            &execution_artifact,
+            &shapley_artifact,
+            &inner_public_values,
+        );
+        let agg_ms = agg_start.elapsed().as_millis() as u64;
+        emit(&event_tx, "aggregator", 100);
+        let _ = event_tx.send(WsEvent::AggregationComplete { time_ms: agg_ms });
+        // Skip Groth16 wrap progress — we never wrap a single aggregator proof
+        // on the Plan-B path. Frontend infers Plan-B from the settlement event.
+        info!(
+            "prove_epoch finished via Plan-B; 3 sub-proofs, {} agents, agg {} ms",
+            plan_b_payload.shapley_weights.len(),
+            agg_ms,
+        );
+        return Ok(AggregateOutcome::PlanB(plan_b_payload));
+    }
 
     let aggregated = match real_prover.as_ref() {
         Some(rp) => {
@@ -322,6 +394,8 @@ pub async fn prove_epoch(
                 )
                 .await?;
                 // public_values comes from the proof itself — do NOT overwrite.
+                // Prepend the schema byte for the on-chain transport.
+                agg.public_values = crate::settlement::with_schema_byte(&agg.public_values);
                 agg.shapley_weights = shapley_weights.clone();
                 agg
             }
@@ -336,7 +410,7 @@ pub async fn prove_epoch(
                         &execution_artifact.stub_bytes,
                         &shapley_artifact.stub_bytes,
                     ]),
-                    public_values: mock_public_values,
+                    public_values: crate::settlement::with_schema_byte(&inner_public_values),
                     shapley_weights: shapley_weights.clone(),
                 }
             }
@@ -347,7 +421,7 @@ pub async fn prove_epoch(
                 &execution_artifact.stub_bytes,
                 &shapley_artifact.stub_bytes,
             ]),
-            public_values: mock_public_values,
+            public_values: crate::settlement::with_schema_byte(&inner_public_values),
             shapley_weights: shapley_weights.clone(),
         },
     };
@@ -370,7 +444,41 @@ pub async fn prove_epoch(
         aggregated.shapley_weights.len(),
         agg_ms,
     );
-    Ok(aggregated)
+    Ok(AggregateOutcome::Wrapped(aggregated))
+}
+
+/// Build a Plan-B payload from the three child artifacts on the mock path.
+/// Each sub-proof is just `mock_prove` over its stub bytes; each pv blob is
+/// the same schema-prefixed `[0x01] || abi(epoch, payouts)` shape — the
+/// MockSP1Verifier accepts everything, so this is fine for end-to-end demos.
+#[allow(clippy::too_many_arguments)]
+fn build_plan_b_mock(
+    epoch: u64,
+    payouts_bps: &[u16],
+    shapley_weights: &[(AgentId, u16)],
+    solver_artifact: &ChildProofArtifact,
+    execution_artifact: &ChildProofArtifact,
+    shapley_artifact: &ChildProofArtifact,
+    inner_pv: &[u8],
+) -> PlanBPayload {
+    let pv = crate::settlement::with_schema_byte(inner_pv);
+    PlanBPayload {
+        epoch,
+        payouts_bps: payouts_bps.to_vec(),
+        shapley_weights: shapley_weights.to_vec(),
+        solver: PlanBChild {
+            proof_bytes: mock_prove(&[&solver_artifact.stub_bytes, b"plan-b-solver"]),
+            public_values: pv.clone(),
+        },
+        execution: PlanBChild {
+            proof_bytes: mock_prove(&[&execution_artifact.stub_bytes, b"plan-b-execution"]),
+            public_values: pv.clone(),
+        },
+        shapley: PlanBChild {
+            proof_bytes: mock_prove(&[&shapley_artifact.stub_bytes, b"plan-b-shapley"]),
+            public_values: pv,
+        },
+    }
 }
 
 /// Keccak hash of (epoch, intent_commitments, cooperative_mev_value).
@@ -801,7 +909,11 @@ mod tests {
         let cfg = ProverConfig::from_compiled(true);
 
         let result = prove_epoch(&cfg, None, intents, state, health, tx.clone()).await;
-        let agg = result.expect("prove_epoch failed");
+        let outcome = result.expect("prove_epoch failed");
+        let agg = match outcome {
+            AggregateOutcome::Wrapped(w) => w,
+            AggregateOutcome::PlanB(_) => panic!("expected Wrapped outcome on default path"),
+        };
 
         // Drop sender so try_recv eventually returns Closed (not Empty).
         drop(tx);
@@ -863,10 +975,11 @@ mod tests {
         );
 
         // Aggregated proof: mock_prove yields a 128-byte stub; public
-        // values are the ABI-encoded (uint256 epoch, uint16[] payouts)
-        // = 3 header words + n_intents element words = (3+n)*32 bytes.
+        // values are `[SCHEMA_VERSION] || abi(uint256 epoch, uint16[] payouts)`
+        // = 1 + (3 + n_intents) * 32 bytes (M1 outer schema-byte wrapper).
         assert_eq!(agg.proof_bytes.len(), 128);
-        assert_eq!(agg.public_values.len(), (3 + n_intents) * 32);
+        assert_eq!(agg.public_values.len(), 1 + (3 + n_intents) * 32);
+        assert_eq!(agg.public_values[0], 1, "schema byte must lead pv blob");
         assert_eq!(agg.shapley_weights.len(), n_intents);
 
         // Shapley weights must sum to exactly 10_000 bps (efficiency

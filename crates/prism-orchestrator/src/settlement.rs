@@ -1,17 +1,58 @@
 //! On-chain settlement — calls `PrismHook.settleEpoch(proof, publicValues)`
 //! on Unichain Sepolia after the proving pipeline produces a Groth16 proof.
 //!
-//! Uses Foundry's `cast send` as the transaction executor because:
-//! 1. Foundry is already installed (Dev 2 uses it for contract deployment)
-//! 2. It handles nonce management, gas estimation, and EIP-1559 automatically
-//! 3. Avoids pulling in heavy Rust Ethereum SDK dependencies (alloy/ethers)
+//! This is the in-process alloy-based implementation. The prior version
+//! shelled out to `cast send` and passed the operator private key via env,
+//! which left it readable in `/proc/<pid>/environ` to anyone with `ptrace`
+//! (audit C9 follow-up). The current implementation signs and broadcasts
+//! the transaction directly through `alloy-provider` + `alloy-signer-local`
+//! — the key never crosses a process boundary.
 //!
 //! Required env vars:
 //!   - `PRISM_HOOK_ADDRESS` — deployed PrismHook contract on Unichain Sepolia
-//!   - `PRIVATE_KEY` — operator EOA private key (must have OPERATOR_ROLE)
+//!   - `PRIVATE_KEY` — operator EOA (must hold the `operators[..]=true` slot
+//!     on the deployed PrismHook; otherwise `settleEpoch` reverts with
+//!     `NotOperator`)
 //!   - `UNICHAIN_RPC_URL` — Unichain Sepolia JSON-RPC endpoint
 
-use tracing::{error, info, warn};
+use alloy_network::{EthereumWallet, TransactionBuilder};
+use alloy_primitives::{Address, Bytes};
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_types_eth::TransactionRequest;
+use alloy_signer_local::PrivateKeySigner;
+use alloy_sol_types::{sol, SolCall};
+use std::str::FromStr;
+use tracing::{info, warn};
+
+sol! {
+    /// Minimal interface for the on-chain call site. The full PrismHook ABI
+    /// lives in `contracts/src/PrismHook.sol`.
+    interface IPrismHook {
+        function settleEpoch(bytes proof, bytes publicValues) external;
+        function settleEpochThreeProof(
+            bytes solverProof, bytes solverPv,
+            bytes executionProof, bytes executionPv,
+            bytes shapleyProof, bytes shapleyPv,
+            uint256 epoch, uint16[] payouts
+        ) external;
+        function setSubVkeys(bytes32 solver, bytes32 execution, bytes32 shapley) external;
+    }
+}
+
+/// Outer-wrapper schema version for on-chain `publicValues`. Mirrors
+/// `PrismHook.SCHEMA_VERSION` — the hook will revert with
+/// `SchemaVersionUnsupported` if the byte doesn't match.
+pub const SCHEMA_VERSION: u8 = 1;
+
+/// Prepend the SCHEMA_VERSION byte to an inner public-values blob before
+/// submitting to the hook. The proof remains bound to the inner bytes only
+/// (the byte is advisory, see PrismHook NatSpec).
+pub fn with_schema_byte(inner: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(inner.len() + 1);
+    out.push(SCHEMA_VERSION);
+    out.extend_from_slice(inner);
+    out
+}
 
 /// Configuration for on-chain settlement. Loaded from environment variables.
 #[derive(Clone, Debug)]
@@ -48,8 +89,9 @@ impl SettlementConfig {
 
 /// Submit the Groth16 proof + public values to `PrismHook.settleEpoch` on-chain.
 ///
-/// Calls `cast send <hook> "settleEpoch(bytes,bytes)" <proof> <pv>` via
-/// subprocess, parses the transaction hash from JSON output.
+/// Signs the tx in-process with `alloy-signer-local`, builds a
+/// recommended-fillers provider that handles nonce / gas / EIP-1559
+/// automatically, awaits one confirmation, and returns the tx hash.
 ///
 /// # Arguments
 /// - `config` — on-chain settlement env vars
@@ -58,16 +100,13 @@ impl SettlementConfig {
 /// - `public_values` — ABI-encoded `(uint256 epoch, uint16[] payouts)`
 ///
 /// # Returns
-/// The transaction hash as a `0x`-prefixed hex string.
+/// The transaction hash as a `0x`-prefixed lowercase hex string.
 pub async fn settle_epoch_onchain(
     config: &SettlementConfig,
     epoch: u64,
     proof_bytes: &[u8],
     public_values: &[u8],
 ) -> anyhow::Result<String> {
-    let proof_hex = format!("0x{}", hex::encode(proof_bytes));
-    let pv_hex = format!("0x{}", hex::encode(public_values));
-
     info!(
         "settlement: submitting epoch {} — hook={} proof={}B pv={}B",
         epoch,
@@ -76,58 +115,146 @@ pub async fn settle_epoch_onchain(
         public_values.len(),
     );
 
-    // Use Foundry's `cast send` to submit the transaction.
-    // `cast` handles: ABI encoding, nonce, gas estimation, EIP-1559, signing.
-    //
-    // The private key goes via `ETH_PRIVATE_KEY` env var on the spawned
-    // process (cast reads it automatically when `--private-key` is omitted).
-    // Passing it as a CLI arg would expose it in /proc/<pid>/cmdline to any
-    // other user on the host.
-    let output = tokio::process::Command::new("cast")
-        .args([
-            "send",
-            &config.hook_address,
-            "settleEpoch(bytes,bytes)",
-            &proof_hex,
-            &pv_hex,
-            "--rpc-url",
-            &config.rpc_url,
-            "--json",
-        ])
-        .env("ETH_PRIVATE_KEY", &config.private_key)
-        .output()
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to run `cast send`: {} (is Foundry installed? run `foundryup`)",
-                e
-            )
-        })?;
+    let signer: PrivateKeySigner = PrivateKeySigner::from_str(&config.private_key)
+        .map_err(|e| anyhow::anyhow!("settlement: invalid PRIVATE_KEY: {}", e))?;
+    let wallet = EthereumWallet::from(signer);
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        error!("settlement: epoch {} tx failed: {}", epoch, stderr);
-        return Err(anyhow::anyhow!("settlement tx failed: {}", stderr));
+    let rpc_url = config
+        .rpc_url
+        .parse()
+        .map_err(|e| anyhow::anyhow!("settlement: invalid UNICHAIN_RPC_URL: {}", e))?;
+    let provider = ProviderBuilder::new()
+        .with_recommended_fillers()
+        .wallet(wallet)
+        .on_http(rpc_url);
+
+    let hook_address = Address::from_str(&config.hook_address)
+        .map_err(|e| anyhow::anyhow!("settlement: invalid PRISM_HOOK_ADDRESS: {}", e))?;
+
+    let call = IPrismHook::settleEpochCall {
+        proof: Bytes::copy_from_slice(proof_bytes),
+        publicValues: Bytes::copy_from_slice(public_values),
+    };
+
+    let tx = TransactionRequest::default()
+        .with_to(hook_address)
+        .with_input(call.abi_encode());
+
+    let pending = provider
+        .send_transaction(tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("settlement: send_transaction failed: {}", e))?;
+
+    let receipt = pending
+        .with_required_confirmations(1)
+        .get_receipt()
+        .await
+        .map_err(|e| anyhow::anyhow!("settlement: receipt fetch failed: {}", e))?;
+
+    let tx_hash = format!("0x{:x}", receipt.transaction_hash);
+    if !receipt.status() {
+        return Err(anyhow::anyhow!(
+            "settlement: epoch {} reverted on-chain — tx={}",
+            epoch,
+            tx_hash
+        ));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let tx_hash = parse_tx_hash(&stdout).unwrap_or_else(|| {
-        warn!("settlement: could not parse tx hash from cast output, using raw");
-        format!("0x{}", hex::encode(&stdout.as_bytes()[..32.min(stdout.len())]))
-    });
-
-    info!("settlement: epoch {} settled on-chain — tx={}", epoch, tx_hash);
+    info!(
+        "settlement: epoch {} settled on-chain — tx={} block={}",
+        epoch,
+        tx_hash,
+        receipt.block_number.unwrap_or_default()
+    );
     Ok(tx_hash)
 }
 
-/// Extract `"transactionHash"` from `cast send --json` output.
-fn parse_tx_hash(json_output: &str) -> Option<String> {
-    // Simple extraction without pulling in serde_json.
-    // Cast JSON format: {"transactionHash":"0x...","blockNumber":"42",...}
-    let marker = "\"transactionHash\":\"";
-    let start = json_output.find(marker)? + marker.len();
-    let end = json_output[start..].find('"')? + start;
-    Some(json_output[start..end].to_string())
+/// Plan-B settlement variant: submit three sub-proofs + their (already
+/// schema-prefixed) public-values blobs + a claimed `(epoch, payouts)` tuple
+/// to `PrismHook.settleEpochThreeProof`. Use as a fallback when Groth16 wrap
+/// fails. Trust assumption shifts: the hook verifies each sub-STARK but
+/// trusts the operator to relay `(epoch, payouts)` faithfully — see PrismHook
+/// NatSpec on `settleEpochThreeProof`.
+#[allow(clippy::too_many_arguments)]
+pub async fn settle_epoch_three_proof_onchain(
+    config: &SettlementConfig,
+    epoch: u64,
+    solver_proof: &[u8],
+    solver_pv: &[u8],
+    execution_proof: &[u8],
+    execution_pv: &[u8],
+    shapley_proof: &[u8],
+    shapley_pv: &[u8],
+    payouts: &[u16],
+) -> anyhow::Result<String> {
+    info!(
+        "settlement: submitting Plan-B epoch {} — hook={} solver={}B exec={}B shapley={}B payouts={:?}",
+        epoch,
+        config.hook_address,
+        solver_proof.len(),
+        execution_proof.len(),
+        shapley_proof.len(),
+        payouts,
+    );
+
+    let signer: PrivateKeySigner = PrivateKeySigner::from_str(&config.private_key)
+        .map_err(|e| anyhow::anyhow!("settlement: invalid PRIVATE_KEY: {}", e))?;
+    let wallet = EthereumWallet::from(signer);
+
+    let rpc_url = config
+        .rpc_url
+        .parse()
+        .map_err(|e| anyhow::anyhow!("settlement: invalid UNICHAIN_RPC_URL: {}", e))?;
+    let provider = ProviderBuilder::new()
+        .with_recommended_fillers()
+        .wallet(wallet)
+        .on_http(rpc_url);
+
+    let hook_address = Address::from_str(&config.hook_address)
+        .map_err(|e| anyhow::anyhow!("settlement: invalid PRISM_HOOK_ADDRESS: {}", e))?;
+
+    let call = IPrismHook::settleEpochThreeProofCall {
+        solverProof: Bytes::copy_from_slice(solver_proof),
+        solverPv: Bytes::copy_from_slice(solver_pv),
+        executionProof: Bytes::copy_from_slice(execution_proof),
+        executionPv: Bytes::copy_from_slice(execution_pv),
+        shapleyProof: Bytes::copy_from_slice(shapley_proof),
+        shapleyPv: Bytes::copy_from_slice(shapley_pv),
+        epoch: alloy_primitives::U256::from(epoch),
+        payouts: payouts.to_vec(),
+    };
+
+    let tx = TransactionRequest::default()
+        .with_to(hook_address)
+        .with_input(call.abi_encode());
+
+    let pending = provider
+        .send_transaction(tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("settlement: send_transaction failed: {}", e))?;
+
+    let receipt = pending
+        .with_required_confirmations(1)
+        .get_receipt()
+        .await
+        .map_err(|e| anyhow::anyhow!("settlement: receipt fetch failed: {}", e))?;
+
+    let tx_hash = format!("0x{:x}", receipt.transaction_hash);
+    if !receipt.status() {
+        return Err(anyhow::anyhow!(
+            "settlement: Plan-B epoch {} reverted on-chain — tx={}",
+            epoch,
+            tx_hash
+        ));
+    }
+
+    info!(
+        "settlement: Plan-B epoch {} settled on-chain — tx={} block={}",
+        epoch,
+        tx_hash,
+        receipt.block_number.unwrap_or_default()
+    );
+    Ok(tx_hash)
 }
 
 #[cfg(test)]
@@ -135,30 +262,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_tx_hash_from_cast_json() {
-        let json = r#"{"transactionHash":"0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890","blockNumber":"42"}"#;
-        assert_eq!(
-            parse_tx_hash(json),
-            Some("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_tx_hash_missing_field() {
-        assert_eq!(parse_tx_hash("not json at all"), None);
-    }
-
-    #[test]
-    fn parse_tx_hash_partial_json() {
-        let json = r#"{"blockNumber":"42","gasUsed":"260000"}"#;
-        assert_eq!(parse_tx_hash(json), None);
-    }
-
-    #[test]
     fn config_from_env_returns_none_when_missing() {
         // With no env vars set, should return None.
-        // (This test relies on PRISM_HOOK_ADDRESS not being set in CI.)
-        // We can't easily unset vars in a test, so just verify the function exists.
         let _ = SettlementConfig::from_env();
+    }
+
+    #[test]
+    fn settle_epoch_call_abi_encode_has_selector_and_two_dynamic_args() {
+        let call = IPrismHook::settleEpochCall {
+            proof: Bytes::from(vec![0xCA, 0xFE]),
+            publicValues: Bytes::from(vec![0xBE, 0xEF]),
+        };
+        let bytes = call.abi_encode();
+        // Two dynamic args → at minimum 4 (selector) + 32 (offset1) +
+        // 32 (offset2) + 32 (len1) + 32 (proof padded) + 32 (len2) +
+        // 32 (pv padded) = 196 bytes. Use ≥132 as a loose lower bound.
+        assert!(bytes.len() >= 132);
+    }
+
+    #[test]
+    fn with_schema_byte_prepends_one_and_preserves_inner() {
+        let inner = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let wrapped = with_schema_byte(&inner);
+        assert_eq!(wrapped[0], SCHEMA_VERSION);
+        assert_eq!(wrapped[0], 1);
+        assert_eq!(&wrapped[1..], &inner[..]);
+    }
+
+    #[test]
+    fn settle_three_proof_call_encodes_eight_args() {
+        let call = IPrismHook::settleEpochThreeProofCall {
+            solverProof: Bytes::from(vec![0x01]),
+            solverPv: Bytes::from(vec![0x01, 0xAA]),
+            executionProof: Bytes::from(vec![0x02]),
+            executionPv: Bytes::from(vec![0x01, 0xBB]),
+            shapleyProof: Bytes::from(vec![0x03]),
+            shapleyPv: Bytes::from(vec![0x01, 0xCC]),
+            epoch: alloy_primitives::U256::from(7u64),
+            payouts: vec![4000, 2500, 2000, 1500, 0],
+        };
+        let bytes = call.abi_encode();
+        // Selector (4) + 8 head words (32 each) + payload tail.
+        assert!(bytes.len() >= 4 + 8 * 32);
+    }
+
+    #[test]
+    fn private_key_signer_round_trips_canonical_hex() {
+        // Anvil's first canonical key — verify our parser accepts the
+        // 0x-prefixed format `.env.example` uses.
+        let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let signer = PrivateKeySigner::from_str(key).expect("parse anvil key");
+        let expected: Address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+            .parse()
+            .unwrap();
+        assert_eq!(signer.address(), expected);
     }
 }

@@ -9,15 +9,24 @@
 SP1_PROGRAMS := solver-proof execution-proof shapley-proof aggregator
 ELF_PATH = sp1-programs/$(1)/elf/riscv32im-succinct-zkvm-elf
 
-.PHONY: help test verify-elf refresh-elf-shas rebuild-elfs extract-vkey
+# Pinned SP1 SDK build — bump alongside the toolchain in `sp1-programs/*/Cargo.toml`.
+# `cargo prove --version` must contain this commit hash for `verify-sp1-version`
+# to pass. A drift means ELF rebuilds may produce a different vkey, which
+# silently breaks the deployed AGGREGATOR_VKEY mapping (see C2 in
+# AUDIT_REPORT). Bumping the pin means: (1) reinstall SP1 toolchain, (2)
+# `make rebuild-elfs && make refresh-elf-shas`, (3) re-extract + redeploy.
+SP1_PINNED_COMMIT := 563ede1
+
+.PHONY: help test verify-elf refresh-elf-shas rebuild-elfs extract-vkey verify-sp1-version
 
 help:
 	@echo "PRISM Makefile targets:"
-	@echo "  make test              — cargo test --workspace"
-	@echo "  make verify-elf        — assert ELF SHAs match ELF_SHAS.txt"
-	@echo "  make refresh-elf-shas  — rewrite ELF_SHAS.txt from current ELFs"
-	@echo "  make rebuild-elfs      — cargo prove build × 4 SP1 programs"
-	@echo "  make extract-vkey      — print current AGGREGATOR_VKEY"
+	@echo "  make test               — cargo test --workspace"
+	@echo "  make verify-elf         — assert ELF SHAs match ELF_SHAS.txt"
+	@echo "  make refresh-elf-shas   — rewrite ELF_SHAS.txt from current ELFs"
+	@echo "  make rebuild-elfs       — cargo prove build × 4 SP1 programs"
+	@echo "  make extract-vkey       — print current AGGREGATOR_VKEY"
+	@echo "  make verify-sp1-version — assert pinned SP1 toolchain (commit $(SP1_PINNED_COMMIT))"
 
 test:
 	cargo test --workspace
@@ -74,3 +83,20 @@ rebuild-elfs:
 extract-vkey:
 	cargo run --release --no-default-features --features real-prover \
 		-p prism-orchestrator --example extract_aggregator_vkey
+
+# Build hygiene: assert the installed SP1 toolchain matches the pinned commit.
+# `cargo prove --version` prints e.g. `cargo-prove sp1 (563ede1 ...)`.
+verify-sp1-version:
+	@actual=$$(cargo prove --version 2>/dev/null | head -n1); \
+	if [ -z "$$actual" ]; then \
+		echo "FAIL: cargo prove not installed — run \`sp1up\` first"; exit 1; \
+	fi; \
+	echo "expected: cargo-prove with commit $(SP1_PINNED_COMMIT)"; \
+	echo "actual:   $$actual"; \
+	if echo "$$actual" | grep -q "$(SP1_PINNED_COMMIT)"; then \
+		echo "OK"; \
+	else \
+		echo "FAIL: SP1 toolchain commit drifted — pin is $(SP1_PINNED_COMMIT)."; \
+		echo "      Reinstall with \`sp1up --version <pinned>\` then \`make rebuild-elfs\`."; \
+		exit 1; \
+	fi
