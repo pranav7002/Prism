@@ -1,14 +1,7 @@
 import { useNavigate } from "react-router-dom";
 import TelemetryMatrix from "@/components/prism/TelemetryMatrix";
 import SwarmAbstraction from "@/components/prism/SwarmAbstraction";
-
-const agents = [
-  { sym: "α", name: "Predictive", role: "Forecasts tick ranges & volatility regimes.", color: "hsl(var(--agent-alpha))" },
-  { sym: "β", name: "Curator", role: "Rebalances liquidity weights across pools.", color: "hsl(var(--agent-beta))" },
-  { sym: "γ", name: "Healer", role: "Detects drift and auto-rebalances positions.", color: "hsl(var(--agent-gamma))" },
-  { sym: "δ", name: "Backrunner", role: "Captures cooperative MEV for LPs.", color: "hsl(var(--agent-delta))" },
-  { sym: "ε", name: "Guardian", role: "Attests every action with a ZK proof.", color: "hsl(var(--agent-epsilon))" },
-];
+import { AGENTS } from "@/lib/agents";
 
 const Landing = () => {
   const nav = useNavigate();
@@ -72,9 +65,9 @@ const Landing = () => {
           <h2 className="display text-3xl md:text-4xl mt-2">Five agents. One protocol.</h2>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
-          {agents.map((a) => (
+          {AGENTS.map((a) => (
             <div
-              key={a.sym}
+              key={a.key}
               className="glass p-5 transition-all duration-300 hover:-translate-y-0.5"
               style={{ borderColor: "hsl(var(--foreground) / 0.06)" }}
             >
@@ -86,13 +79,13 @@ const Landing = () => {
                     border: `1px solid ${a.color}55`,
                   }}
                 >
-                  <span className="display text-lg" style={{ color: a.color }}>{a.sym}</span>
+                  <span className="display text-lg" style={{ color: a.color }}>{a.symbol}</span>
                 </span>
                 <span className="mono text-[10px] uppercase tracking-[0.14em]" style={{ color: a.color }}>
                   {a.name}
                 </span>
               </div>
-              <p className="text-[12.5px] text-foreground/65 leading-relaxed">{a.role}</p>
+              <p className="text-[12.5px] text-foreground/65 leading-relaxed">{a.description}</p>
             </div>
           ))}
         </div>

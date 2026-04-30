@@ -150,4 +150,26 @@ describe("derivedState", () => {
       expect(lastSettlePath([raw])).toBe("groth16");
     });
   });
+
+  describe("live-mode no-fake-data invariants", () => {
+    // These pin the contract that, in live mode with empty events, every
+    // selector returns a falsy/empty value rather than a fabricated stub.
+    // If a future selector starts returning Math.random() defaults, this
+    // suite breaks.
+    it("currentEpoch on [] is null (no fabricated epoch number)", () => {
+      expect(currentEpoch([])).toBeNull();
+    });
+    it("lastShapley on [] is null (no fabricated payout split)", () => {
+      expect(lastShapley([])).toBeNull();
+    });
+    it("lastSettlePath on [] is null (no claimed groth16/plan-b)", () => {
+      expect(lastSettlePath([])).toBeNull();
+    });
+    it("solverConflicts on [] is 0 (no fabricated conflict count)", () => {
+      expect(solverConflicts([])).toBe(0);
+    });
+    it("proofProgress on [] is empty object (no canned 75%)", () => {
+      expect(proofProgress([])).toEqual({});
+    });
+  });
 });

@@ -1,18 +1,10 @@
-type AgentKey = "alpha" | "beta" | "gamma" | "delta" | "epsilon";
-
-const colorVar: Record<AgentKey, string> = {
-  alpha: "hsl(var(--agent-alpha))",
-  beta: "hsl(var(--agent-beta))",
-  gamma: "hsl(var(--agent-gamma))",
-  delta: "hsl(var(--agent-delta))",
-  epsilon: "hsl(var(--agent-epsilon))",
-};
+import { AGENT_COLORS, type AgentKey } from "@/lib/agents";
 
 interface Props { agent: AgentKey; size?: number; }
 
 // Lightweight SVG "Lottie-like" idle-breathing geometric glyph (bespoke per agent)
 const AgentGlyph = ({ agent, size = 140 }: Props) => {
-  const stroke = colorVar[agent];
+  const stroke = AGENT_COLORS[agent];
   const common = { stroke, strokeWidth: 1, fill: "none", strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
 
   return (
@@ -72,3 +64,4 @@ const AgentGlyph = ({ agent, size = 140 }: Props) => {
 
 export default AgentGlyph;
 export type { AgentKey };
+

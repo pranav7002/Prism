@@ -5,7 +5,6 @@ import { useWsEvents } from "@/lib/wsClient";
 import { currentEpoch, currentPhaseIdx } from "@/lib/derivedState";
 
 const phases = ["Commit", "Reveal", "Solve", "Prove", "Settle"] as const;
-type Phase = typeof phases[number];
 
 const phaseDuration = 8; // seconds each
 

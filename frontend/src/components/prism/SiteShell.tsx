@@ -2,6 +2,8 @@ import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import AmbientBackground from "./AmbientBackground";
 import { useDemoMode } from "@/store/demoMode";
+import { useWsEvents } from "@/lib/wsClient";
+import { currentEpoch } from "@/lib/derivedState";
 import DemoToggle from "./DemoToggle";
 import PlanBPill from "./PlanBPill";
 
@@ -12,9 +14,31 @@ const navItems = [
   { to: "/settlement", label: "Settlement" },
 ];
 
+const ConnectionDot = ({ demo, connected }: { demo: boolean; connected: boolean }) => {
+  if (demo) return null;
+  const tone = connected
+    ? { bg: "hsl(142 70% 45%)", glow: "hsl(142 70% 45% / 0.5)", label: "WebSocket connected" }
+    : { bg: "hsl(38 95% 60%)", glow: "hsl(38 95% 60% / 0.5)", label: "Reconnecting…" };
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground"
+      title={tone.label}
+      aria-live="polite"
+    >
+      <span
+        className={`h-1.5 w-1.5 rounded-full ${connected ? "animate-soft-pulse" : "animate-pulse"}`}
+        style={{ background: tone.bg, boxShadow: `0 0 8px ${tone.glow}` }}
+      />
+      {connected ? "live" : "retry"}
+    </span>
+  );
+};
+
 const SiteShell = () => {
   const location = useLocation();
-  const { demo, toggle } = useDemoMode();
+  const { demo, toggle, wsUrl } = useDemoMode();
+  const { events, connected } = useWsEvents(wsUrl, !demo);
+  const liveEpoch = !demo ? currentEpoch(events) : null;
 
   return (
     <div className="relative min-h-screen grain overflow-hidden">
@@ -74,8 +98,12 @@ const SiteShell = () => {
           </nav>
           <div className="flex items-center gap-3">
             <span className="mono text-[11px] uppercase tracking-[0.12em] text-muted-foreground hidden sm:inline">
-              Epoch <span className="tabular text-foreground/80">#8492</span>
+              Epoch{" "}
+              <span className="tabular text-foreground/80">
+                {demo ? "#8492" : liveEpoch !== null ? `#${liveEpoch}` : "—"}
+              </span>
             </span>
+            <ConnectionDot demo={demo} connected={connected} />
             <PlanBPill />
             <DemoToggle />
           </div>

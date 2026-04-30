@@ -5,12 +5,15 @@ import { useWsEvents } from "@/lib/wsClient";
 import { proofProgress } from "@/lib/derivedState";
 import { Cpu, Database, Network } from "lucide-react";
 
-type Track = { key: string; label: string; color: string; cycles: string };
-// Track keys match WsEvent ProofProgress program names (PascalCase)
+type Track = { key: string; label: string; color: string };
+// Track keys match WsEvent ProofProgress program names (PascalCase).
+// SP1 cycle counts vary per epoch and are not reported in the current wire
+// format — we surface progress percentage from `proof_progress` events
+// instead, which is what the orchestrator actually emits.
 const tracks: Track[] = [
-  { key: "Solver", label: "Solver Matrix", color: "hsl(var(--agent-alpha))", cycles: "12,459,102" },
-  { key: "Execution", label: "Pool Execution", color: "hsl(var(--agent-beta))", cycles: "4,192,840" },
-  { key: "Shapley", label: "Shapley Vector", color: "hsl(var(--agent-delta))", cycles: "8,921,411" },
+  { key: "Solver", label: "Solver Matrix", color: "hsl(var(--agent-alpha))" },
+  { key: "Execution", label: "Pool Execution", color: "hsl(var(--agent-beta))" },
+  { key: "Shapley", label: "Shapley Vector", color: "hsl(var(--agent-delta))" },
 ];
 
 type Phase = "generating" | "merging" | "wrapping" | "verified";
@@ -27,6 +30,13 @@ const ProofPipeline = () => {
 
   const [phase, setPhase] = useState<Phase>("generating");
   const [demoProgress, setDemoProgress] = useState<Record<string, number>>(EMPTY_PROGRESS);
+
+  // When DEMO/LIVE is toggled mid-epoch, force back to a clean state so the
+  // bars don't carry stale progress from the other mode.
+  useEffect(() => {
+    setPhase("generating");
+    setDemoProgress(EMPTY_PROGRESS);
+  }, [demo]);
 
   // Demo animation — synchronized to global demoPhaseIdx
   useEffect(() => {
@@ -96,9 +106,10 @@ const ProofPipeline = () => {
   // Determine which progress values to display
   const progress = hasLiveData ? liveProgress! : demoProgress;
 
-  const liveString = tracks
-    .map((t) => `${t.label} ${Math.floor(progress[t.key] ?? 0)}%`)
-    .join(", ");
+  const liveString = useMemo(
+    () => tracks.map((t) => `${t.label} ${Math.floor(progress[t.key] ?? 0)}%`).join(", "),
+    [progress],
+  );
 
   return (
     <div className="glass p-8 md:p-10" style={{ minHeight: 460 }}>
@@ -131,11 +142,12 @@ const ProofPipeline = () => {
                   </span>
                   <div className="flex items-center gap-3">
                     {pct === 100 && (
-                      <motion.span 
-                        initial={{ opacity: 0 }} animate={{ opacity: 1 }}
+                      <motion.span
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
                         className="mono text-[9px] text-muted-foreground hidden sm:block bg-black/30 px-2 py-0.5 rounded border border-white/5"
                       >
-                        {t.cycles} cycles
+                        ✓ proven
                       </motion.span>
                     )}
                     <span className="mono text-[10px] tabular" style={{ color: t.color }}>

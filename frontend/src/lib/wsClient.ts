@@ -30,6 +30,13 @@ const MAX_EVENTS = 100;
 const BASE_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
 
+// Watchdog: if no event arrives for STALE_TIMEOUT_MS the socket is considered
+// stuck (the underlying TCP can stay open while the orchestrator is paused or
+// behind a kernel-level pause). We force-close it, which trips the existing
+// exponential-backoff reconnect path. Checked every HEARTBEAT_CHECK_MS.
+const STALE_TIMEOUT_MS = 30_000;
+const HEARTBEAT_CHECK_MS = 5_000;
+
 export function useWsEvents(
   url: string,
   enabled: boolean
@@ -41,13 +48,23 @@ export function useWsEvents(
   const wsRef = useRef<WebSocket | null>(null);
   const backoffRef = useRef(BASE_BACKOFF_MS);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const lastEventAtRef = useRef<number>(Date.now());
   const mountedRef = useRef(true);
 
   useEffect(() => {
     mountedRef.current = true;
 
+    const stopHeartbeat = () => {
+      if (heartbeatRef.current) {
+        clearInterval(heartbeatRef.current);
+        heartbeatRef.current = null;
+      }
+    };
+
     if (!enabled) {
       // Tear down any live connection when switching back to demo
+      stopHeartbeat();
       if (wsRef.current) {
         wsRef.current.onclose = null;
         wsRef.current.close();
@@ -62,6 +79,24 @@ export function useWsEvents(
       return;
     }
 
+    const startHeartbeat = () => {
+      stopHeartbeat();
+      heartbeatRef.current = setInterval(() => {
+        if (!mountedRef.current) return;
+        const ws = wsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const elapsed = Date.now() - lastEventAtRef.current;
+        if (elapsed > STALE_TIMEOUT_MS) {
+          // Force close — `onclose` will then schedule a reconnect.
+          try {
+            ws.close(4000, "stale-no-events");
+          } catch {
+            // ignore
+          }
+        }
+      }, HEARTBEAT_CHECK_MS);
+    };
+
     const connect = () => {
       if (!mountedRef.current) return;
 
@@ -71,7 +106,9 @@ export function useWsEvents(
       ws.onopen = () => {
         if (!mountedRef.current) { ws.close(); return; }
         backoffRef.current = BASE_BACKOFF_MS; // reset on success
+        lastEventAtRef.current = Date.now();
         setConnected(true);
+        startHeartbeat();
       };
 
       ws.onmessage = (evt: MessageEvent) => {
@@ -79,6 +116,7 @@ export function useWsEvents(
         try {
           const parsed = JSON.parse(evt.data as string) as WsEvent;
           if (!parsed || !parsed.type) return; // Drop malformed payloads to prevent selector crashes
+          lastEventAtRef.current = Date.now();
           setEvents((prev) => [parsed, ...prev].slice(0, MAX_EVENTS));
         } catch {
           // Ignore malformed messages
@@ -91,6 +129,7 @@ export function useWsEvents(
 
       ws.onclose = () => {
         if (!mountedRef.current) return;
+        stopHeartbeat();
         setConnected(false);
         wsRef.current = null;
 
@@ -105,6 +144,7 @@ export function useWsEvents(
 
     return () => {
       mountedRef.current = false;
+      stopHeartbeat();
       if (retryTimerRef.current) {
         clearTimeout(retryTimerRef.current);
         retryTimerRef.current = null;

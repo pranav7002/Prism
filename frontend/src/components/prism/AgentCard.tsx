@@ -1,5 +1,6 @@
-import AgentGlyph, { type AgentKey } from "./AgentGlyph";
+import AgentGlyph from "./AgentGlyph";
 import Odometer from "./Odometer";
+import { AGENT_COLORS, type AgentKey } from "@/lib/agents";
 
 interface Props {
   agent: AgentKey;
@@ -14,20 +15,12 @@ interface Props {
   targetPayout?: number; // 0-100
 }
 
-const colorVar: Record<AgentKey, string> = {
-  alpha: "hsl(var(--agent-alpha))",
-  beta: "hsl(var(--agent-beta))",
-  gamma: "hsl(var(--agent-gamma))",
-  delta: "hsl(var(--agent-delta))",
-  epsilon: "hsl(var(--agent-epsilon))",
-};
-
 const AgentCard = ({ agent, symbol, name, description, uptime, priority, className, status = "idle", lastAction = "—", targetPayout = 0 }: Props) => {
-  const c = colorVar[agent];
+  const c = AGENT_COLORS[agent];
   return (
     <article
       className={`glass group relative p-8 transition-all duration-300 ease-out hover:bg-surface-1/60 ${className ?? ""}`}
-      style={{ ['--ring-c' as any]: c, minHeight: 380 }}
+      style={{ ...({ "--ring-c": c } as React.CSSProperties), minHeight: 380 }}
     >
       <div
         className="pointer-events-none absolute inset-0 rounded-[var(--radius)] opacity-0 transition-opacity duration-300 group-hover:opacity-100"

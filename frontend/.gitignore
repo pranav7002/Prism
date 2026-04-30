@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Lockfile hygiene — repo standardizes on package-lock.json
+bun.lockb
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

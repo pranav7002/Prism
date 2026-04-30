@@ -24,7 +24,10 @@ export const DemoModeProvider = ({ children }: { children: ReactNode }) => {
   const [demo, setDemo] = useState(true);
   const [demoPhaseIdx, setDemoPhaseIdx] = useState(0);
   const [demoHistory, setDemoHistory] = useState<EpochData[]>([]);
-  const [epochCounter, setEpochCounter] = useState(8492);
+  // `setEpochCounter` is read inside the interval below to mint a new epoch
+  // id each cycle. The current value is only used through the setter's
+  // functional form, so we ignore the read with the underscore prefix.
+  const [, setEpochCounter] = useState(8492);
 
   useEffect(() => {
     if (!demo) return;
