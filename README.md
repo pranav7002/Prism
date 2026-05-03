@@ -111,7 +111,7 @@ Watches realized swap volatility and proposes a new dynamic fee via **`SetDynami
 
 Scans on-chain LP positions for **fragmentation** — ticks far from the active range that no longer earn fees — and proposes **`BatchConsolidate`** intents to migrate them back. γ improves capital efficiency for the whole pool, and the resulting tighter spread is part of what δ later backruns.
 
-- **Action types**: `BatchConsolidate`, `RemoveLiquidity`, `AddLiquidity`
+- **Action types**: `BatchConsolidate`
 - **Capabilities**: `canLP`
 - **Brain**: [`agent-brains/gamma/brain.py`](./agent-brains/gamma/brain.py)
 
@@ -119,9 +119,9 @@ Scans on-chain LP positions for **fragmentation** — ticks far from the active 
 
 > *"I capture the arbitrage that β's fee migration creates — and share the upside with the LPs whose moves I exploited."*
 
-Detects price-spread windows opened by α/β/γ activity and proposes **`SwapExactInput` / `Backrun`** intents. The "symbiotic" part: the Shapley solver attributes part of δ's profit back to whichever agents created the spread, so backrunning *funds* the LPs instead of bleeding them.
+Detects price-spread windows opened by α/β/γ activity and proposes **`Backrun`** intents. The "symbiotic" part: the Shapley solver attributes part of δ's profit back to whichever agents created the spread, so backrunning *funds* the LPs instead of bleeding them.
 
-- **Action types**: `SwapExactInput`, `Backrun`
+- **Action types**: `Backrun`
 - **Capabilities**: `canSwap`, `canBackrun`
 - **Brain**: [`agent-brains/delta/brain.py`](./agent-brains/delta/brain.py)
 
@@ -129,9 +129,9 @@ Detects price-spread windows opened by α/β/γ activity and proposes **`SwapExa
 
 > *"If anything in DeFi breaks, I hedge the pool and pull the kill-switch before the bad price hits."*
 
-Monitors **Aave health-factor**, oracle deviations, and bridge status. On a risk signal, ε submits a priority-100 **`Hedge`** or **`KillSwitch`** intent that overrides all four other agents (see the Crisis Scenario diagram below). ε is the only agent with `canKillSwitch` — and the only one that can halt settlement mid-epoch.
+Monitors **Aave health-factor**, oracle deviations, and bridge status. On a risk signal, ε submits a priority-100 **`DeltaHedge`** / **`CrossProtocolHedge`** / **`KillSwitch`** intent that overrides all four other agents (see the Crisis Scenario diagram below). ε is the only agent with `canKillSwitch` — and the only one that can halt settlement mid-epoch.
 
-- **Action types**: `Hedge`, `KillSwitch`
+- **Action types**: `DeltaHedge`, `CrossProtocolHedge`, `KillSwitch`
 - **Capabilities**: `canHedge`, `canKillSwitch`
 - **Brain**: [`agent-brains/epsilon/brain.py`](./agent-brains/epsilon/brain.py)
 
@@ -214,13 +214,24 @@ We implement **6 V4 hook callbacks** — exactly the six v2 §7.1 requires, mine
 
 ### 3. PoolManager Integration
 
-`PrismHook` holds an immutable reference to the canonical Unichain Sepolia `IPoolManager`:
+`PrismHook` declares an immutable reference to V4's `IPoolManager`, set in the constructor and frozen for the contract's lifetime:
 
 ```solidity
-IPoolManager public immutable poolManager = IPoolManager(0x00B036B58a818B1BC34d502D3fE730Db729e62AC);
+// contracts/src/PrismHook.sol
+IPoolManager public immutable poolManager;
+
+constructor(IPoolManager _poolManager, ...) {
+    poolManager = _poolManager;
+    // ...
+}
+
+modifier onlyPoolManager() {
+    if (msg.sender != address(poolManager)) revert NotPoolManager();
+    _;
+}
 ```
 
-Every callback is gated by `onlyPoolManager` — no off-chain entity can spoof a V4 callback into our hook.
+The deploy script (`contracts/script/DeployPrismHook.s.sol`) wires this to Unichain Sepolia's canonical PoolManager at `0x00B036B58a818B1BC34d502D3fE730Db729e62AC`. Every V4 callback on the hook is gated by `onlyPoolManager` — no off-chain entity can spoof a V4 callback into our hook.
 
 ### 4. Dynamic Fees via `LPFeeLibrary` (β agent)
 
