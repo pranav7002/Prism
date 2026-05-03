@@ -562,19 +562,6 @@ cd frontend && npm test && cd ..
 
 ---
 
-## Demo Video
-
-A walkthrough video of PRISM running end-to-end (orchestrator + agent swarm + frontend + on-chain settlement on Unichain Sepolia) is recorded and pending upload.
-
-**In the meantime, the live dashboard is the best way to see PRISM in motion:**
-
-> 🌐 **[prism-ochre-five.vercel.app](https://prism-ochre-five.vercel.app/)**
-
-It runs in DEMO mode by default — judges land on a self-contained loop that cycles through the full epoch lifecycle (intent collection → proof pipeline → Shapley payout → on-chain settlement) without needing to spin up the local stack. Flip to LIVE mode if you have a local orchestrator running.
-
-_(YouTube link will be added here once the video is published.)_
-
----
 
 ## Whitepaper Reference
 
