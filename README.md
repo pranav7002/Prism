@@ -1,5 +1,9 @@
 # PRISM
 
+> **🦄 Built for the Uniswap Foundation track.** Deployed live on Unichain Sepolia as a native Uniswap V4 hook.
+>
+> **🌐 Live Demo:** [**prism-ochre-five.vercel.app**](https://prism-ochre-five.vercel.app/) — open it in any browser to see the dashboard run end-to-end. Defaults to DEMO mode (scripted epochs cycling through the proof pipeline + Shapley payouts); flip the **DEMO / LIVE** pill in the header to point at a running orchestrator.
+
 ## Introduction
 
 PRISM isn't just another MEV protection layer — it's a paradigm shift in how Uniswap V4 pools defend themselves. The future of DeFi holds a thousand specialized agents trading against your LPs. Today's V4 hooks aren't ready for them.
@@ -560,9 +564,17 @@ cd frontend && npm test && cd ..
 
 ---
 
-## YouTube Link
+## Demo Video
 
-> **Video Demo**: _(coming soon — link will be added here)_
+A walkthrough video of PRISM running end-to-end (orchestrator + agent swarm + frontend + on-chain settlement on Unichain Sepolia) is recorded and pending upload.
+
+**In the meantime, the live dashboard is the best way to see PRISM in motion:**
+
+> 🌐 **[prism-ochre-five.vercel.app](https://prism-ochre-five.vercel.app/)**
+
+It runs in DEMO mode by default — judges land on a self-contained loop that cycles through the full epoch lifecycle (intent collection → proof pipeline → Shapley payout → on-chain settlement) without needing to spin up the local stack. Flip to LIVE mode if you have a local orchestrator running.
+
+_(YouTube link will be added here once the video is published.)_
 
 ---
 
