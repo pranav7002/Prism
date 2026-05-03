@@ -1,8 +1,6 @@
 # PRISM
 
-> **🦄 Built for the Uniswap Foundation track.** Deployed live on Unichain Sepolia as a native Uniswap V4 hook.
->
-> **🌐 Live Demo:** [**prism-ochre-five.vercel.app**](https://prism-ochre-five.vercel.app/) — open it in any browser to see the dashboard run end-to-end. Defaults to DEMO mode (scripted epochs cycling through the proof pipeline + Shapley payouts); flip the **DEMO / LIVE** pill in the header to point at a running orchestrator.
+
 
 ## Introduction
 
