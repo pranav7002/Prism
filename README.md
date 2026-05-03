@@ -162,6 +162,53 @@ These flags are **enforced on-chain** in `PrismHook.agentCaps[agent]` — an int
 - **Powered by SP1 + Uniswap V4 + Alloy**: Rust end-to-end on the prover side, Solidity on the hook side, typed Vite/React dashboard streaming live `WsEvent`s over WebSocket.
 
 ---
+## Architecture & User Flow
+
+### User Architecture
+
+![PRISM full-stack architecture: Python agent swarm → Rust orchestrator (WebSocket + conflict solver) → SP1 RISC-V zkVM proving stack (solver/execution/shapley/aggregator → 260B Groth16) → On-chain PrismHook on Unichain with SP1 Verifier Gateway, atomic settlement and payouts](./assets/diagrams/architecture.jpeg)
+
+Vertical pipeline from off-chain agent intents (Python, JSON + keccak) through the Rust orchestrator's WebSocket server and conflict solver, into parallel SP1 STARK proving, recursively aggregated and Groth16-wrapped, finally landing on `PrismHook.sol` on Unichain — which calls the SP1 Verifier Gateway and atomically settles Shapley payouts.
+
+### Agent Coordination Around the V4 Pool
+
+![Agent coordination diagram: ε Guardian holds priority-100 kill-switch over α/β/γ/δ; α (concentrated liquidity) and β (dynamic fee + migration) inform each other; β migration creates spreads for γ (batch consolidate) and δ (arbitrage backrun); ε holds cross-protocol hedge; all five act on the Uniswap V4 USDC/WETH pool](./assets/diagrams/agent-coordination.jpeg)
+
+Each agent has a specialized lane against the V4 pool, but they're not isolated — β's dynamic fee informs α's LP positioning, β's migration creates the spread γ batch-consolidates and δ arbitrage-backruns, and ε holds a cross-protocol hedge plus a priority-100 kill-switch that can override every other agent. The Shapley split rewards each agent's marginal contribution to this coordinated dance.
+
+### Crisis Scenario — ε Guardian Override
+
+![Crisis epoch scenario: α/β/γ/δ intents (priorities 70/65/50/92) all suppressed when ε Guardian submits a priority-100 kill-switch intent that overrides all four; only ε executes through the Rust Solver into Epoch 3 Settlement](./assets/diagrams/crisis-scenario.jpeg)
+
+When the ε Guardian observes a cross-protocol risk signal (Aave health-factor breach, oracle deviation, etc.), it submits a priority-100 kill-switch intent. Inside the Rust solver, that intent **overrides all four lower-priority intents** — α, β, γ, δ are all marked `Suppressed`, and only ε's hedge action lands in the settlement bundle. This is the §10.3 crisis walkthrough; the proof still validates Shapley axioms over the (one-agent) coalition, so the same hook accepts it without special-casing.
+
+### User Flow
+
+```mermaid
+flowchart LR
+    U(["User / LP / Trader"]) -->|"swap / add liquidity"| POOL["Uniswap V4 Pool"]
+    POOL -->|"hook callback"| HOOK["PrismHook"]
+    HOOK -->|"emits IntentWindowOpen"| AGENTS["5 Agents observe"]
+    AGENTS -->|"1. commitIntent on-chain"| HOOK
+    AGENTS -->|"2. reveal over WS"| ORCH["Rust Orchestrator"]
+    ORCH -->|"3. solve + 4 proofs"| SP1["SP1 zkVM"]
+    SP1 -->|"4. Groth16 (260B)"| HOOK
+    HOOK -->|"5. verify + payouts"| AGENTS
+    HOOK -->|"6. fair execution"| POOL
+    POOL -->|"better fill"| U
+    ORCH -.->|"live WsEvent"| DASH["Dashboard"]
+
+    style U fill:#1e3a8a,stroke:#3b82f6,color:#dbeafe
+    style HOOK fill:#14532d,stroke:#22c55e,color:#dcfce7
+    style ORCH fill:#1e293b,stroke:#64748b,color:#e2e8f0
+    style SP1 fill:#7c2d12,stroke:#f97316,color:#fef3c7
+    style POOL fill:#581c87,stroke:#a855f7,color:#f3e8ff
+    style AGENTS fill:#0f172a,stroke:#475569,color:#e2e8f0
+    style DASH fill:#1e3a8a,stroke:#3b82f6,color:#dbeafe
+```
+
+---
+
 
 ## 🦄 How PRISM Uses Uniswap
 
@@ -349,53 +396,6 @@ function settleEpochThreeProof(
 ```
 
 Each sub-proof is verified against its own vkey (set once via `setSubVkeys`, then `freezeSubVkeys` for production). The shapley sub-proof's public values carry the canonical `(epoch, payouts)` pair — the hook still distributes Shapley-fair, the wrapping is just unbundled.
-
----
-
-## Architecture & User Flow
-
-### User Architecture
-
-![PRISM full-stack architecture: Python agent swarm → Rust orchestrator (WebSocket + conflict solver) → SP1 RISC-V zkVM proving stack (solver/execution/shapley/aggregator → 260B Groth16) → On-chain PrismHook on Unichain with SP1 Verifier Gateway, atomic settlement and payouts](./assets/diagrams/architecture.jpeg)
-
-Vertical pipeline from off-chain agent intents (Python, JSON + keccak) through the Rust orchestrator's WebSocket server and conflict solver, into parallel SP1 STARK proving, recursively aggregated and Groth16-wrapped, finally landing on `PrismHook.sol` on Unichain — which calls the SP1 Verifier Gateway and atomically settles Shapley payouts.
-
-### Agent Coordination Around the V4 Pool
-
-![Agent coordination diagram: ε Guardian holds priority-100 kill-switch over α/β/γ/δ; α (concentrated liquidity) and β (dynamic fee + migration) inform each other; β migration creates spreads for γ (batch consolidate) and δ (arbitrage backrun); ε holds cross-protocol hedge; all five act on the Uniswap V4 USDC/WETH pool](./assets/diagrams/agent-coordination.jpeg)
-
-Each agent has a specialized lane against the V4 pool, but they're not isolated — β's dynamic fee informs α's LP positioning, β's migration creates the spread γ batch-consolidates and δ arbitrage-backruns, and ε holds a cross-protocol hedge plus a priority-100 kill-switch that can override every other agent. The Shapley split rewards each agent's marginal contribution to this coordinated dance.
-
-### Crisis Scenario — ε Guardian Override
-
-![Crisis epoch scenario: α/β/γ/δ intents (priorities 70/65/50/92) all suppressed when ε Guardian submits a priority-100 kill-switch intent that overrides all four; only ε executes through the Rust Solver into Epoch 3 Settlement](./assets/diagrams/crisis-scenario.jpeg)
-
-When the ε Guardian observes a cross-protocol risk signal (Aave health-factor breach, oracle deviation, etc.), it submits a priority-100 kill-switch intent. Inside the Rust solver, that intent **overrides all four lower-priority intents** — α, β, γ, δ are all marked `Suppressed`, and only ε's hedge action lands in the settlement bundle. This is the §10.3 crisis walkthrough; the proof still validates Shapley axioms over the (one-agent) coalition, so the same hook accepts it without special-casing.
-
-### User Flow
-
-```mermaid
-flowchart LR
-    U(["User / LP / Trader"]) -->|"swap / add liquidity"| POOL["Uniswap V4 Pool"]
-    POOL -->|"hook callback"| HOOK["PrismHook"]
-    HOOK -->|"emits IntentWindowOpen"| AGENTS["5 Agents observe"]
-    AGENTS -->|"1. commitIntent on-chain"| HOOK
-    AGENTS -->|"2. reveal over WS"| ORCH["Rust Orchestrator"]
-    ORCH -->|"3. solve + 4 proofs"| SP1["SP1 zkVM"]
-    SP1 -->|"4. Groth16 (260B)"| HOOK
-    HOOK -->|"5. verify + payouts"| AGENTS
-    HOOK -->|"6. fair execution"| POOL
-    POOL -->|"better fill"| U
-    ORCH -.->|"live WsEvent"| DASH["Dashboard"]
-
-    style U fill:#1e3a8a,stroke:#3b82f6,color:#dbeafe
-    style HOOK fill:#14532d,stroke:#22c55e,color:#dcfce7
-    style ORCH fill:#1e293b,stroke:#64748b,color:#e2e8f0
-    style SP1 fill:#7c2d12,stroke:#f97316,color:#fef3c7
-    style POOL fill:#581c87,stroke:#a855f7,color:#f3e8ff
-    style AGENTS fill:#0f172a,stroke:#475569,color:#e2e8f0
-    style DASH fill:#1e3a8a,stroke:#3b82f6,color:#dbeafe
-```
 
 ---
 
