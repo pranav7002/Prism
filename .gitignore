@@ -7,6 +7,36 @@ target/
 # SP1 build artifacts
 sp1-programs/**/elf/
 
+# Python
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets / environment — NEVER commit keys or env files
+.env
+.env.*
+!.env.example
+*.env
+.env.agents
+*.key
+*.secret
+*.pem
+
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# Node / Vite / Next.js
+node_modules/
+**/node_modules/
+.next/
+.vite/
+dist/
+build/
+
 # IDE / editor
 .vscode/
 .idea/
